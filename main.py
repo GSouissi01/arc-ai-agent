@@ -2,11 +2,14 @@
 ARC WRFM sample agent - harness entry point.
 
 Usage:
-    # Run all WRFM tasks in a full session
-    python main.py
-
-    # Run one WRFM task by exact spec_id
+    # Run one WRFM task by exact spec_id (dev run)
     python main.py --spec wrfm_def_001
+
+    # Run ALL WRFM tasks and SUBMIT a scored session
+    python main.py --submit
+
+    # No flag: refuses to start a scored session and exits with code 2
+    python main.py
 """
 from __future__ import annotations
 
@@ -235,7 +238,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ARC WRFM sample agent")
     parser.add_argument("--spec", help="Run one WRFM task by exact spec_id")
     parser.add_argument("--workspace", default="dev-wrfm", help="Session workspace tag (default: dev-wrfm)")
+    parser.add_argument("--submit", action="store_true", help="Run ALL tasks and SUBMIT a scored session")
     args = parser.parse_args()
+
+    # Checked before any platform/LLM call so a bare `python main.py` makes no network request.
+    if not args.spec and not args.submit:
+        print("Refusing to start a scored session without --submit. Use --spec <id> for dev runs.")
+        raise SystemExit(2)
 
     try:
         api = _build_platform_client()

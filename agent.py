@@ -6,7 +6,8 @@ over the WRFM API request models. WrfmClient.dispatch() handles routing.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import time
 from typing import Annotated, List, Union
 
@@ -151,6 +152,28 @@ class LLMFormatError(RuntimeError):
 class _TaskState:
     responded: bool = False
     reason: str = f"Agent reached max steps ({MAX_STEPS}) without responding."
+    loaded_docs: set[str] = field(default_factory=set)
+    create_keys: set[tuple] = field(default_factory=set)
+    recommended: dict[str, set[str]] = field(default_factory=dict)
+
+
+def _create_key(fn, state):
+    keys = state.recommended.get(fn.table_name, set())
+    pairs = [(fv.field_name, str(fv.value)) for fv in fn.field_values]
+    sig = tuple(sorted(p for p in pairs if p[0] in keys)) or tuple(sorted(pairs))
+    return (fn.table_name, sig)
+
+
+def _write_block_reason(fn, state):
+    if not isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)):
+        return None
+    if not any("governance" in p.lower() for p in state.loaded_docs):
+        return ("WRITE BLOCKED: load the governance (RACI) wiki document and confirm your role "
+                "is authorized for this activity before any create or update.")
+    if isinstance(fn, Req_WrfmDataCreate) and _create_key(fn, state) in state.create_keys:
+        return ("DUPLICATE WRITE BLOCKED: this row was already created earlier in this task. "
+                "Do not repeat it. Verify with a select, or respond.")
+    return None
 
 
 def _call_llm(
@@ -176,6 +199,7 @@ def _call_llm(
                     model=llm_config.model,
                     input=_to_responses_input(messages),
                     text_format=response_model,
+                    temperature=0,
                 )
                 step = resp.output_parsed
             else:
@@ -183,6 +207,7 @@ def _call_llm(
                     model=llm_config.model,
                     response_format=response_model,
                     messages=messages,
+                    temperature=0,
                 )
                 step = resp.choices[0].message.parsed
             if step is not None:
@@ -257,6 +282,14 @@ def _run_agent_loop(
     for label, text in bootstrap_log:
         print(f"  {CLI_GREEN}AUTO {label}{CLI_CLR}: {text[:120]}")
         log.append({"role": "user", "content": f"[{label}]\n{text}"})
+        if label == "data_schema":
+            try:
+                tables = json.loads(text)["tables"]
+                state.recommended = {
+                    table: set(info.get("recommended_filters", [])) for table, info in tables.items()
+                }
+            except Exception:
+                state.recommended = {}
 
     log.append({"role": "user", "content": task.task_text})
     response_model = _response_model_for_provider(llm_config.provider)
@@ -312,7 +345,7 @@ def _run_agent_loop(
 
         log.append({
             "role": "assistant",
-            "content": step.plan[0],
+            "content": f"STATE: {step.current_state}\nEXECUTED: {fn_type} {fn.model_dump_json(exclude_none=True)}",
             "tool_calls": [{
                 "type": "function",
                 "id": step_id,
@@ -324,19 +357,28 @@ def _run_agent_loop(
         })
 
         dispatch_ok = False
-        try:
-            result = wrfm.dispatch(fn)
-            result_text = result.model_dump_json(exclude_none=True)
-            dispatch_ok = True
-            print(f"    {CLI_GREEN}->{CLI_CLR} {result_text[:200]}")
-        except ApiException as exc:
-            result_text = f'{{"error": "{exc.api_error.error}", "code": "{exc.api_error.code}"}}'
-            print(f"    {CLI_RED}ERR: {exc.api_error.error}{CLI_CLR}")
-        except Exception as exc:
-            result_text = f'{{"error": "{exc}"}}'
-            print(f"    {CLI_RED}ERR: {exc}{CLI_CLR}")
+        block = _write_block_reason(fn, state)
+        if block:
+            result_text = json.dumps({"error": block, "code": "blocked_by_agent_guard"})
+            print(f"    {CLI_RED}BLOCKED: {block}{CLI_CLR}")
+        else:
+            try:
+                result = wrfm.dispatch(fn)
+                result_text = result.model_dump_json(exclude_none=True)
+                dispatch_ok = True
+                print(f"    {CLI_GREEN}->{CLI_CLR} {result_text[:200]}")
+                if isinstance(fn, Req_WikiLoad):
+                    state.loaded_docs.add(fn.path)
+                if isinstance(fn, Req_WrfmDataCreate):
+                    state.create_keys.add(_create_key(fn, state))
+            except ApiException as exc:
+                result_text = exc.api_error.model_dump_json(exclude_none=True)
+                print(f"    {CLI_RED}ERR: {exc.api_error.error}{CLI_CLR}")
+            except Exception as exc:
+                result_text = f'{{"error": "{exc}"}}'
+                print(f"    {CLI_RED}ERR: {exc}{CLI_CLR}")
 
-        log.append({"role": "tool", "content": result_text, "tool_call_id": step_id})
+        log.append({"role": "tool", "content": f"RESULT of {fn_type}: {result_text}", "tool_call_id": step_id})
 
         if isinstance(fn, Req_WrfmRespond):
             if dispatch_ok:
