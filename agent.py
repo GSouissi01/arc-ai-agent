@@ -11,8 +11,8 @@ import time
 from typing import Annotated, List, Union
 
 from annotated_types import MaxLen, MinLen
-from openai import OpenAI
-from pydantic import BaseModel, Field
+from openai import BadRequestError, OpenAI
+from pydantic import BaseModel, Field, ValidationError
 
 from ogchallenge_client import ApiException, CoreClient, TaskInfo, WrfmClient
 from ogchallenge_client.dtos import (
@@ -45,7 +45,8 @@ class LLMConfig:
 
 
 def make_llm_client(config: LLMConfig) -> OpenAI:
-    kwargs: dict = {"api_key": config.api_key}
+    # Higher retry budget for provider 429s (e.g. Groq free tier); the SDK backs off itself.
+    kwargs: dict = {"api_key": config.api_key, "max_retries": 6, "timeout": 60.0}
     if config.base_url:
         kwargs["base_url"] = config.base_url
     if config.default_headers:
@@ -138,6 +139,83 @@ Do not mutate records when the task asks only for review, anomaly checking, or c
 """
 
 MAX_STEPS = 30
+FORMAT_RETRIES = 2
+FORMAT_RETRY_PROMPT = "Return ONLY the NextStep JSON object matching the schema. Do not call tools. No prose."
+
+
+class LLMFormatError(RuntimeError):
+    """Raised when the LLM keeps returning output that does not match NextStep."""
+
+
+@dataclass
+class _TaskState:
+    responded: bool = False
+    reason: str = f"Agent reached max steps ({MAX_STEPS}) without responding."
+
+
+def _call_llm(
+    client: OpenAI,
+    llm_config: LLMConfig,
+    log: list[dict],
+    response_model: type[BaseModel],
+    *,
+    spec_id: str,
+    step_num: int,
+):
+    """Call the LLM and return (resp, parsed NextStep), retrying format failures.
+
+    Retries use a temporary copy of the log with a format reminder; failed
+    attempts are never added to the conversation history.
+    """
+    messages = log
+    code = "unknown"
+    for attempt in range(FORMAT_RETRIES + 1):
+        try:
+            if llm_config.provider == "openai":
+                resp = client.responses.parse(
+                    model=llm_config.model,
+                    input=_to_responses_input(messages),
+                    text_format=response_model,
+                )
+                step = resp.output_parsed
+            else:
+                resp = client.beta.chat.completions.parse(
+                    model=llm_config.model,
+                    response_format=response_model,
+                    messages=messages,
+                )
+                step = resp.choices[0].message.parsed
+            if step is not None:
+                return resp, step
+            code = "parse_none"
+        except BadRequestError as exc:
+            if getattr(exc, "code", None) != "tool_use_failed" and "tool_use_failed" not in str(exc):
+                raise
+            code = "tool_use_failed"
+        except ValidationError:
+            code = "validation_error"
+
+        if attempt == FORMAT_RETRIES:
+            break
+        print(
+            f"\n    {CLI_YELLOW}RETRY spec={spec_id} step={step_num} code={code} "
+            f"attempt={attempt + 1}/{FORMAT_RETRIES}{CLI_CLR} ",
+            end="",
+            flush=True,
+        )
+        messages = log + [{"role": "user", "content": FORMAT_RETRY_PROMPT}]
+
+    raise LLMFormatError(
+        f"LLM output did not match NextStep after {FORMAT_RETRIES} retries (last error: {code})"
+    )
+
+
+def _send_fallback_respond(wrfm: WrfmClient, reason: str) -> None:
+    print(f"\n  {CLI_YELLOW}Sending fallback respond: error_internal - {reason}{CLI_CLR}")
+    try:
+        wrfm.respond(message=reason, outcome="error_internal")
+    except Exception as exc:
+        print(f"  {CLI_RED}Fallback respond failed: {exc}{CLI_CLR}")
 
 
 def run_agent(
@@ -146,8 +224,27 @@ def run_agent(
     *,
     llm_config: LLMConfig,
 ) -> None:
-    client = make_llm_client(llm_config)
+    """Run one task; guarantees exactly one recorded wrfm_respond per task."""
     wrfm = api.get_wrfm_client(task)
+    state = _TaskState()
+    try:
+        _run_agent_loop(api, task, wrfm, llm_config, state)
+    except BaseException as exc:
+        state.reason = f"Agent failed: {type(exc).__name__}: {exc}"[:300]
+        raise
+    finally:
+        if not state.responded:
+            _send_fallback_respond(wrfm, state.reason)
+
+
+def _run_agent_loop(
+    api: CoreClient,
+    task: TaskInfo,
+    wrfm: WrfmClient,
+    llm_config: LLMConfig,
+    state: _TaskState,
+) -> None:
+    client = make_llm_client(llm_config)
 
     print(f"\n{CLI_CYAN}Task: {task.spec_id}{CLI_CLR}")
     print(f"  {task.task_text}\n")
@@ -170,18 +267,12 @@ def run_agent(
 
         t0 = time.time()
         try:
-            if llm_config.provider == "openai":
-                resp = client.responses.parse(
-                    model=llm_config.model,
-                    input=_to_responses_input(log),
-                    text_format=response_model,
-                )
-            else:
-                resp = client.beta.chat.completions.parse(
-                    model=llm_config.model,
-                    response_format=response_model,
-                    messages=log,
-                )
+            resp, step = _call_llm(
+                client, llm_config, log, response_model,
+                spec_id=task.spec_id, step_num=i + 1,
+            )
+        except LLMFormatError:
+            raise
         except Exception as exc:
             raise RuntimeError(
                 "LLM request failed for "
@@ -192,19 +283,13 @@ def run_agent(
         elapsed_ms = int((time.time() - t0) * 1000)
 
         if llm_config.provider == "openai":
-            step = resp.output_parsed
             prompt_tokens = resp.usage.input_tokens if resp.usage else None
             completion_tokens = resp.usage.output_tokens if resp.usage else None
             cached_prompt_tokens = getattr(getattr(resp.usage, "input_tokens_details", None), "cached_tokens", None)
         else:
-            step = resp.choices[0].message.parsed
             prompt_tokens = resp.usage.prompt_tokens if resp.usage else None
             completion_tokens = resp.usage.completion_tokens if resp.usage else None
             cached_prompt_tokens = getattr(getattr(resp.usage, "prompt_tokens_details", None), "cached_tokens", None)
-
-        if step is None:
-            print(f"{CLI_RED}LLM returned unparseable response{CLI_CLR}")
-            break
 
         fn = step.function
         fn_type = fn.type
@@ -238,9 +323,11 @@ def run_agent(
             }],
         })
 
+        dispatch_ok = False
         try:
             result = wrfm.dispatch(fn)
             result_text = result.model_dump_json(exclude_none=True)
+            dispatch_ok = True
             print(f"    {CLI_GREEN}->{CLI_CLR} {result_text[:200]}")
         except ApiException as exc:
             result_text = f'{{"error": "{exc.api_error.error}", "code": "{exc.api_error.code}"}}'
@@ -252,6 +339,10 @@ def run_agent(
         log.append({"role": "tool", "content": result_text, "tool_call_id": step_id})
 
         if isinstance(fn, Req_WrfmRespond):
+            if dispatch_ok:
+                state.responded = True
+            else:
+                state.reason = f"Agent respond was rejected by the API: {result_text}"[:300]
             print(f"\n  {CLI_GREEN}Agent responded: {fn.outcome}{CLI_CLR}")
             print(f"  {CLI_BLUE}{fn.message}{CLI_CLR}")
             if fn.ground_refs:
