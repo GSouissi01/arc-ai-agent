@@ -391,3 +391,17 @@ No prompt text changed.
 **Evidence:** a close task with no time and two open events ("Close the open deferment record.") scored "expected no write actions got 1": the agent created a missing day row of another open event before its END_DATE update was blocked. Replay of all fix-008b / fix-009 / fix-010 close-intent runs (19): no passing run wrote under close + no time; the only run the guard would block is that failing one.
 
 **Known limit:** intent detection is keyword-based, so a non-close task whose text contains a close word (e.g. "restart") and no time is also treated as close.
+
+## P-014 (2026-10-11, fix-014): answer-only bare numbers formatted by code
+
+**Rule 9 (prompt), changed text**
+
+```
+9. Answer format: if the task asks for "only" a value (a figure, a number, a name), the message must be exactly that value and nothing else: no words, no units. Bare-number answers are formatted by the system; output the raw value only. Otherwise keep messages concise.
+```
+
+(Removed: "no thousands separators, at most 2 decimals, as computed".)
+
+**Code:** an ok_answer whose message is a bare number, on an answer-only task ("only ... figure/number/value/volume"), is formatted before it is sent: volume wording in the task (volume/gas/condensate/oil/Sm3/m3) -> `f"{value:,.2f}"`; otherwise an integral value (a count) -> `f"{n:,}"`, any other value -> `f"{value:,.2f}"`. Logged as `NUMFMT: <raw> -> <formatted>`. Messages with text, other outcomes, DB writes and tool arguments are untouched.
+
+**Evidence:** the largest-event gas task was rejected with the correct event and value in every raw form: `14717986.11` (12 runs), `14717986`, `14717986.111111112`, and in prose. A probe sending `14,717,986.11` for the same answer scored 1.00. Replay of 116 traced final answers: only that task's answers change.

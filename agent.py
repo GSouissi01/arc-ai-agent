@@ -224,7 +224,7 @@ Decision checklist (follow in order):
 6. Data: select one table at a time. Do not use order_by. Use local_aggregate for totals, maximums and per-event sums, and local_calc for every arithmetic step. Never do arithmetic in your head.
 7. Tool errors: read the error and change the call. Never repeat an identical failing call. A tool error is never a reason for denied_security or none_unsupported.
 8. Ground refs: cite wiki docs by full path, tables by name, wells by WELL_NAME, and deferment events by EVENT_KEY. Cite only items you actually used in this task. Always cite the deferment event you were asked about (by EVENT_KEY), also in clarification and denied answers. Cite every well you wrote or asked about.
-9. Answer format: if the task asks for "only" a value (a figure, a number, a name), the message must be exactly that value and nothing else: no words, no units, no thousands separators, at most 2 decimals, as computed. Otherwise keep messages concise.
+9. Answer format: if the task asks for "only" a value (a figure, a number, a name), the message must be exactly that value and nothing else: no words, no units. Bare-number answers are formatted by the system; output the raw value only. Otherwise keep messages concise.
 """
 
 MAX_STEPS = 30
@@ -1258,6 +1258,25 @@ def _blocked_write_block(fn: Req_WrfmRespond, state) -> str | None:
     return f"BLOCKED WRITE: {guard} -> respond none_clarification_needed asking for {missing}, cite the event and well"
 
 
+_ONLY_FIGURE = re.compile(r"\bonly\b.*\b(figure|number|value|volume)\b|\b(figure|number|value|volume)\b.*\bonly\b",
+                          re.IGNORECASE)
+_BARE_NUMBER = re.compile(r"^-?\d+(?:\.\d+)?$")
+_VOLUME_WORDING = re.compile(r"\b(volume|gas|condensate|cond|oil|sm3|m3)\b", re.IGNORECASE)
+
+
+def _format_bare_number(fn: Req_WrfmRespond, state) -> str | None:
+    """Answer-only bare-number ok_answer -> display format (evaluator evidence: "14,717,986.11").
+    Volume figures: thousands separators + 2 decimals; other integral values (counts): thousands separators only.
+    None (message untouched) for any other message or task."""
+    message = (fn.message or "").strip()
+    if fn.outcome != "ok_answer" or not _BARE_NUMBER.match(message) or not _ONLY_FIGURE.search(state.task_text):
+        return None
+    value = float(message)
+    if not _VOLUME_WORDING.search(state.task_text) and value.is_integer():
+        return f"{int(value):,}"
+    return f"{value:,.2f}"
+
+
 def _enrich_refs(fn: Req_WrfmRespond, state) -> tuple[Req_WrfmRespond, list[dict]]:
     """Drop refs never seen in this task; add a table ref for every table used. Never adds wiki refs."""
     task_lower = state.task_text.lower()
@@ -1571,6 +1590,11 @@ def _run_agent_loop(
             respond_block = (_respond_block_reason(fn, state) or _blocked_write_block(fn, state)
                              or _event_check_block(fn, state, step.current_state))
             block = block or respond_block
+            if not block:
+                formatted = _format_bare_number(fn, state)
+                if formatted is not None:
+                    _trace(state, {"numfmt": f"NUMFMT: {fn.message.strip()} -> {formatted}"})
+                    fn = fn.model_copy(update={"message": formatted})
         if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)) and block and _clarify_guard(block):
             state.clarify_blocks.append(_clarify_guard(block))
         if isinstance(fn, (LocalCalc, LocalAggregate, LocalDowntime, LocalEventCheck, LocalVolumeEstimate)):
