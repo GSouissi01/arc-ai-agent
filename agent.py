@@ -473,6 +473,10 @@ def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
             _trace(state, {"write_scope": "intent unknown"})
         elif write_type not in allowed:
             return f"WRITE SCOPE: task asks {intent}; {write_type} not allowed"
+        if intent == "close" and not _has_explicit_time(state.task_text):
+            _trace(state, {"close_guard": "CLOSE NO TIME: WRITES BLOCKED", "write_type": write_type})
+            return ("CLOSE NO TIME: WRITES BLOCKED. The close task states no restart/end time: make no create or "
+                    "update. Respond none_clarification_needed asking for the exact restart timestamp.")
     values = {fv.field_name: str(fv.value).strip() for fv in fn.field_values}
     key = _write_event_key(fn)
     existing = _known_event_rows(key, state, wrfm) if is_create else None
@@ -1239,6 +1243,8 @@ def _clarify_guard(block: str) -> tuple[str, str] | None:
         return "OWNER BLOCKED", "the accountable DEFER_ACTIVITY_OWNER"
     if block.startswith("END TIME BLOCKED"):
         return "END TIME BLOCKED", "the exact restart/end timestamp"
+    if block.startswith("CLOSE NO TIME"):
+        return "CLOSE NO TIME", "the exact restart/end timestamp"
     if block.startswith("VOLUME CHECK: no data-derived volume_estimate"):
         return "VOLUME CHECK (no volume_estimate)", "the deferred volumes"
     return None

@@ -92,7 +92,7 @@ check("update owner in task -> allowed", agent._write_block_reason(upd, mk_state
 close = Req_WrfmDataUpdate(table_name="deferments", field_values=kv(END_DATE="2026-02-09T00:00:00"),
                            where_clause=[WrfmCondition(field_name="WELL_NAME", operator="eq", value="WELL-02")])
 msg = agent._write_block_reason(close, mk_state(task="Close WELL-02 deferment as repair is completed and well restarted."), EventDB({}))
-check("close without time -> END TIME BLOCKED", msg and msg.startswith("END TIME BLOCKED"))
+check("close without time -> CLOSE NO TIME (fix-011; was END TIME BLOCKED)", msg and msg.startswith("CLOSE NO TIME"))
 for t in ["restart today at 16:45:00", "restarted at 7:05", "back online at noon", "Close the deferment; downtime from 09:15 to 12am", "restart 3 PM", "Close the deferment at midnight"]:
     check(f"explicit time ok: {t!r}", agent._write_block_reason(close, mk_state(task=t), EventDB({})) is None)
 check("date only is not a time", agent._has_explicit_time("restarted on 2026-02-09") is False)
@@ -101,7 +101,7 @@ check("new event create with END_DATE not time-guarded", agent._write_block_reas
     Req_WrfmDataCreate(table_name="deferments", field_values=kv(**new_with_end)), mk_state(task="Create a new deferment for WELL-01."), EventDB({})) is None)
 exist_end = dict(same, END_DATE="2025-11-12T00:00:00")
 check("existing event create with a different END_DATE, no time -> blocked", agent._write_block_reason(
-    Req_WrfmDataCreate(table_name="deferments", field_values=kv(**exist_end)), mk_state(task="close it"), existing_db).startswith(("END TIME BLOCKED", "EVENT CONSISTENCY")))
+    Req_WrfmDataCreate(table_name="deferments", field_values=kv(**exist_end)), mk_state(task="close it"), existing_db).startswith(("END TIME BLOCKED", "EVENT CONSISTENCY", "CLOSE NO TIME")))
 check("authority still first (OS close)", agent._write_block_reason(close, mk_state(role="Operations Supervisor"), EventDB({})).startswith("AUTHORITY BLOCKED"))
 
 # ---- Step 6: ref enricher ----

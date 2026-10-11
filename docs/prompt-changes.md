@@ -381,3 +381,13 @@ No prompt text changed (rule 4 still mentions "the peers' loss fraction"; the ag
 **What P-005 still covers:** the gate. A flat-ALLOC group-event well is treated as affected only when `_peer_fraction` can be computed (>= 2 peer rows); otherwise it stays `unaffected_wells` and no update to 0 is proposed. Clean-day R, clean_day_diff for CONSTRAINT rows with an ALLOC loss, and every DOWN method are unchanged.
 
 **Evidence:** the review/correct run that got past the update count failed with "expected DEFERRED_GAS_VOL_SM3 1190000.0 got 476000.0" = 2,380,000 x 12 h (08:00-20:00) / 24. Replay of every peer-fraction value in the 42 fix-008b + fix-009 traces: only the failing review/correct task wrote one (476000.0/7.16 -> 1190000.0/17.9); the passing set-owner task only showed it in the info-only bootstrap event check and wrote nothing.
+
+## P-011 (2026-10-11, fix-011): close task without a stated time blocks every write
+
+No prompt text changed.
+
+**Code:** when the task intent is close (P-006 write-scope wording) and the task text has no explicit time (`_has_explicit_time`, the same `_TIME_TOKEN` parser as the END TIME guard), every create and update is blocked with `CLOSE NO TIME: WRITES BLOCKED ...` and logged in the trace. It is a clarification guard: an ok_answer after it is blocked with `BLOCKED WRITE: CLOSE NO TIME -> respond none_clarification_needed`. The authority (RACI) and write-scope checks still run first. A close task with a stated time is unchanged.
+
+**Evidence:** a close task with no time and two open events ("Close the open deferment record.") scored "expected no write actions got 1": the agent created a missing day row of another open event before its END_DATE update was blocked. Replay of all fix-008b / fix-009 / fix-010 close-intent runs (19): no passing run wrote under close + no time; the only run the guard would block is that failing one.
+
+**Known limit:** intent detection is keyword-based, so a non-close task whose text contains a close word (e.g. "restart") and no time is also treated as close.

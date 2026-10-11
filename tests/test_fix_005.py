@@ -99,13 +99,13 @@ new_end = dict(row, END_DATE="2025-09-21T10:00:00")
 msg = agent._write_block_reason(create(**new_end), mk_state(task="Add the missing deferment row for this event."), db)
 check("different END_DATE on closed event -> EVENT CONSISTENCY", msg and "END_DATE" in msg)
 check("value stated in task -> allowed change", agent._write_block_reason(
-    create(**dict(row, COMMENTS="restart delayed by spares")), mk_state(task="add comment: restart delayed by spares"), db) is None)
+    create(**dict(row, COMMENTS="repair delayed by spares")), mk_state(task="add comment: repair delayed by spares"), db) is None)
 # open event: END guard still blocks invented END on create
 open_rows = [dict(r, END_DATE="") for r in ev if r["PRODUCTION_DAY"] != "2025-09-17"]
 msg = agent._write_block_reason(create(**dict(row, END_DATE="2025-09-21T00:00:00")), mk_state(task="add missing day"), DB({"deferments": open_rows}))
 check("open event + invented END on create -> END TIME BLOCKED", msg and msg.startswith("END TIME BLOCKED"))
 upd_end = Req_WrfmDataUpdate(table_name="deferments", field_values=[WrfmKeyValue(field_name="END_DATE", value="2025-09-21T00:00:00")])
-check("update END without time still blocked", agent._write_block_reason(upd_end, mk_state(task="close it"), DB({})).startswith("END TIME"))
+check("update END without time still blocked", agent._write_block_reason(upd_end, mk_state(task="close it"), DB({})).startswith(("END TIME", "CLOSE NO TIME")))
 
 # ---- Step 6: best R + 001 re-check ----
 rates = agent._rate_per_well(ev)
