@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
 import operator
+from pathlib import Path
+import re
 import statistics
 import time
 from typing import Annotated, List, Literal, Optional, Union
@@ -31,6 +33,7 @@ from ogchallenge_client.dtos import (
     Req_WrfmDataUpdate,
     Req_WrfmRespond,
     WrfmCondition,
+    WrfmGroundRef,
 )
 
 CLI_GREEN = "\x1b[32m"
@@ -191,11 +194,12 @@ Decision checklist (follow in order):
    Never ask the user for values you can derive yourself: deferred volumes, event key, or event attributes copied from existing rows.
 3. Write only when the task asks for a change. A review or check task writes only if it also asks you to correct data, and only where the data breaks a wiki rule.
    For review/correct tasks on an event, run local_event_check: create rows for every missing (well, day) pair and fix rows that break a guide rule. Do not change fields the guide does not require.
+   For a group event (G_ key), also create rows for missing_wells reported by local_event_check.
 4. Deferment rules:
    - One row per production day per event. Event-level fields are identical across the event's rows.
    - Adding a missing day row for an existing event: copy EVENT_KEY, START_DATE, cause, system group, category, event type, asset type and activity owner from that event's existing rows.
-   - New event: build EVENT_KEY exactly as the deferment guide says, matching the format of existing keys. Use approved labels only, choosing the closest approved label for the stated cause and system. Leave fields empty that the task and data do not give, unless they are in the guide's minimum information.
-   - Closing an event: run local_event_check first. Create every missing production-day row WITH END_DATE already set to the closing timestamp; the closing-day row is prorated from 00:00 to END_DATE. Then update END_DATE on all existing rows of the event. Then run local_event_check again and confirm missing is empty and every row has the same END_DATE.
+   - New event: build EVENT_KEY exactly as the deferment guide says, matching the format of existing keys. Use approved labels only, choosing the closest approved label for the stated cause and system. Fill every required field. For a new event choose the closest approved labels (cause, system group, activity owner) from the guide. For a row of an existing event copy them.
+   - Closing an event: Only when the task states the restart/end time explicitly. Run local_event_check first. Create every missing production-day row WITH END_DATE already set to the closing timestamp; the closing-day row is prorated from 00:00 to END_DATE. Then update END_DATE on all existing rows of the event. Then run local_event_check again and confirm missing is empty and every row has the same END_DATE.
    - Deferred volumes: deferred volume for a row = R × downtime_h / 24, where R is the well's full-day rate. Get downtime_h and uptime_h from local_downtime, and do the arithmetic with local_calc. Choose R in this order:
      a. Existing event (its rows already exist): always use rate_per_well for that well from local_event_check.
      b. New event with no rows yet that is a full stop (EVENT_TYPE DOWN, or type not stated): daily_production ALLOC values are ACTUAL production, already reduced by downtime, so R = ALLOC on a production day with uptime (e.g. the event start day) × 24 / uptime_h for that day.
@@ -229,6 +233,80 @@ class _TaskState:
     task_text: str = ""
     raci: dict[str, dict[str, str]] = field(default_factory=dict)
     owners: set[tuple[str, str]] = field(default_factory=set)  # (EVENT_KEY, owner lower) seen in data
+    required: dict[str, list[str]] = field(default_factory=dict)  # table -> required fields (data_schema)
+    enums: dict[str, dict[str, list[str]]] = field(default_factory=dict)  # table -> field -> allowed values
+    event_rows: dict[str, list[dict]] = field(default_factory=dict)  # EVENT_KEY -> deferment rows (cache)
+    used_tables: set[str] = field(default_factory=set)
+    seen_ids: set[str] = field(default_factory=set)  # wells / event keys seen in any result
+    trace_path: Path | None = None
+
+
+def _trace(state, record: dict) -> None:
+    """Append one JSON line to this task's trace file; never raises."""
+    if state.trace_path is None:
+        return
+    try:
+        with state.trace_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
+_ID_KEYS = {"WELL_NAME", "well", "EVENT_KEY", "event_key"}
+
+
+def _collect_ids(obj, state) -> None:
+    """Record every well name / event key appearing anywhere in a result."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _ID_KEYS and isinstance(v, str) and v.strip():
+                state.seen_ids.add(v.strip())
+            elif k == "wells" and isinstance(v, list):
+                state.seen_ids.update(str(w) for w in v)
+            else:
+                _collect_ids(v, state)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_ids(v, state)
+
+
+def _select_all(wrfm: WrfmClient, table: str, where: list | None = None) -> list[dict]:
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        page = wrfm.data_select(table, where_clause=where or [], limit=1000, offset=offset)
+        rows.extend(page.rows)
+        if page.next_offset == -1 or page.next_offset <= offset:
+            return rows
+        offset = page.next_offset
+
+
+def _known_event_rows(key: str | None, state, wrfm: WrfmClient | None) -> list[dict] | None:
+    """Existing deferment rows of an event (cached); None if unknown (no client and not seen)."""
+    if not key:
+        return None
+    if key not in state.event_rows and wrfm is not None:
+        try:
+            state.event_rows[key] = _select_all(
+                wrfm, "deferments", [WrfmCondition(field_name="EVENT_KEY", operator="eq", value=key)])
+            _track_owners(state.event_rows[key], state)
+        except Exception:
+            return None
+    if key in state.event_rows:
+        return state.event_rows[key]
+    owners = [o for k, o in state.owners if k == key]
+    return [{"EVENT_KEY": key, "DEFER_ACTIVITY_OWNER": o} for o in owners] or None
+
+
+_EXPLICIT_TIME = [
+    re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b"),
+    re.compile(r"\b(midday|noon|midnight)\b", re.IGNORECASE),
+    re.compile(r"\b\d{1,2}\s?(am|pm)\b", re.IGNORECASE),
+]
+
+
+def _has_explicit_time(text: str) -> bool:
+    return any(p.search(text or "") for p in _EXPLICIT_TIME)
 
 
 def _create_key(fn, state):
@@ -283,7 +361,7 @@ def _track_owners(rows: list[dict], state) -> None:
             state.owners.add((str(key), str(owner).strip().lower()))
 
 
-def _write_block_reason(fn, state):
+def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
     if not isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)):
         return None
     if state.raci:
@@ -296,24 +374,54 @@ def _write_block_reason(fn, state):
     elif not any("governance" in p.lower() for p in state.loaded_docs):
         return ("WRITE BLOCKED: load the governance (RACI) wiki document and confirm your role "
                 "is authorized for this activity before any create or update.")
-    owner = next((str(fv.value).strip() for fv in fn.field_values
-                  if fv.field_name == "DEFER_ACTIVITY_OWNER" and str(fv.value).strip()), None)
-    if owner:
+    values = {fv.field_name: str(fv.value).strip() for fv in fn.field_values}
+    is_create = isinstance(fn, Req_WrfmDataCreate)
+    key = _write_event_key(fn)
+    existing = _known_event_rows(key, state, wrfm) if is_create else None
+
+    if is_create:
+        missing = [f for f in state.required.get(fn.table_name, []) if not values.get(f)]
+        if missing:
+            return (f"MISSING REQUIRED FIELDS: {missing}. For a row of an existing event copy them from that "
+                    "event's rows; for a new event use the closest approved label from the deferment guide.")
+
+    owner = values.get("DEFER_ACTIVITY_OWNER", "")
+    if owner and not is_create:
         in_task = owner.lower() in state.task_text.lower()
-        key = _write_event_key(fn)
         copied = key is not None and (str(key), owner.lower()) in state.owners
         if not (in_task or copied):
             return ("OWNER BLOCKED: DEFER_ACTIVITY_OWNER is the accountable discipline; it is not stated in the "
                     "task or the event's existing rows and must not be inferred. Leave it unchanged/empty, or "
                     "respond none_clarification_needed if setting it is the task.")
-    if isinstance(fn, Req_WrfmDataCreate) and _create_key(fn, state) in state.create_keys:
+    if owner and is_create:
+        if existing:
+            expected = sorted({str(r.get("DEFER_ACTIVITY_OWNER") or "").strip() for r in existing} - {""})
+            if expected and owner.lower() not in {e.lower() for e in expected}:
+                return (f"OWNER BLOCKED: this row belongs to existing event {key}; copy DEFER_ACTIVITY_OWNER "
+                        f"from its rows: {expected[0] if len(expected) == 1 else expected}.")
+        else:
+            allowed = state.enums.get(fn.table_name, {}).get("DEFER_ACTIVITY_OWNER", [])
+            if allowed and owner.lower() not in {a.lower() for a in allowed}:
+                return (f"OWNER BLOCKED: '{owner}' is not an approved DEFER_ACTIVITY_OWNER label. "
+                        f"Allowed values: {allowed}.")
+
+    if values.get("END_DATE") and (not is_create or existing) and not _has_explicit_time(state.task_text):
+        return ("END TIME BLOCKED: the task states no restart/end time. Do not assume one. "
+                "Respond none_clarification_needed asking for the exact restart timestamp.")
+
+    if is_create:
+        volume_block = _volume_check(fn, values, existing, wrfm)
+        if volume_block:
+            return volume_block
+
+    if is_create and _create_key(fn, state) in state.create_keys:
         return ("DUPLICATE WRITE BLOCKED: this row was already created earlier in this task. "
                 "Do not repeat it. Verify with a select, or respond.")
     return None
 
 
-ORDER_BY_NOTE = ("NOTE: order_by is not supported and was removed; rows are unsorted. "
-                 "Use local_aggregate for max/min/sum.")
+ORDER_BY_NOTE = ("NOTE: order_by direction is not supported and was dropped; rows are sorted ascending by "
+                 "{field}. Use local_aggregate for max/min/sum.")
 
 _CALC_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
 
@@ -423,6 +531,66 @@ def _float_or_none(value) -> float | None:
         return None
 
 
+def _rate_per_well(rows: list[dict]) -> dict[str, dict[str, float | None]]:
+    """Median full-day rate per well: deferred x 24 / downtime_h over rows with downtime."""
+    rates: dict[str, dict[str, list[float]]] = {}
+    for r in rows:
+        try:
+            downtime = _downtime_h(r.get("START_DATE"), r.get("END_DATE"), r.get("PRODUCTION_DAY"))
+        except (TypeError, ValueError):
+            continue
+        if downtime <= 0:
+            continue
+        w = rates.setdefault(str(r.get("WELL_NAME")), {"gas": [], "cond": []})
+        for key, vol_field in (("gas", "DEFERRED_GAS_VOL_SM3"), ("cond", "DEFERRED_COND_VOL_STM3")):
+            vol = _float_or_none(r.get(vol_field))
+            if vol is not None:
+                w[key].append(vol * 24 / downtime)
+    return {w: {k: (round(statistics.median(v), 2) if v else None) for k, v in r.items()} for w, r in rates.items()}
+
+
+def _volume_check(fn, values: dict, existing, wrfm) -> str | None:
+    """Validate deferred volumes of a deferment create against R x downtime_h / 24."""
+    if fn.table_name != "deferments" or values.get("EVENT_TYPE", "").upper() == "CONSTRAINT":
+        return None
+    well, day = values.get("WELL_NAME"), values.get("PRODUCTION_DAY")
+    try:
+        downtime = _downtime_h(values.get("START_DATE"), values.get("END_DATE"), day)
+    except (TypeError, ValueError):
+        return None
+    if downtime <= 0:
+        return None
+    uptime = 24.0 - downtime
+    rate, source = None, None
+    if existing and any(r.get("START_DATE") for r in existing):
+        per_well = _rate_per_well(existing).get(str(well))
+        if per_well and per_well.get("gas") is not None:
+            rate, source = per_well, "the event's existing rows (rate_per_well)"
+    if rate is None and wrfm is not None and uptime > 0:
+        try:
+            prod = _select_all(wrfm, "daily_production", [
+                WrfmCondition(field_name="WELL_NAME", operator="eq", value=str(well)),
+                WrfmCondition(field_name="REPORT_DAY", operator="eq", value=str(day)[:10])])
+        except Exception:
+            prod = []
+        if prod:
+            gas, cond = _float_or_none(prod[0].get("ALLOC_GAS_SM3")), _float_or_none(prod[0].get("ALLOC_COND_M3"))
+            if gas is not None and cond is not None:
+                rate = {"gas": gas * 24 / uptime, "cond": cond * 24 / uptime}
+                source = f"daily_production ALLOC on {str(day)[:10]} x 24 / uptime_h {round(uptime, 4)}"
+    if rate is None:
+        return None
+    expected = {"gas": round(rate["gas"] * downtime / 24, 2),
+                "cond": round((rate.get("cond") or 0.0) * downtime / 24, 2)}
+    for key, vol_field in (("gas", "DEFERRED_GAS_VOL_SM3"), ("cond", "DEFERRED_COND_VOL_STM3")):
+        given = _float_or_none(values.get(vol_field))
+        if given is None or given == 0 or abs(given - expected[key]) > 0.01 * abs(expected[key]):
+            return (f"VOLUME CHECK: expected DEFERRED_GAS_VOL_SM3={expected['gas']} and "
+                    f"DEFERRED_COND_VOL_STM3={expected['cond']} (rate R={round(rate['gas'], 2)} from {source}, "
+                    f"downtime_h={round(downtime, 4)}). Resubmit with these values.")
+    return None
+
+
 def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
     """All rows of one event: missing (well, day) pairs, rows without END_DATE, per-well rate."""
     rows: list[dict] = []
@@ -461,18 +629,12 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
         missing += [{"well": w, "day": d.isoformat()} for w in wells if (w, d.isoformat()) not in present]
         d += timedelta(days=1)
 
-    detail, rates = [], {}
+    detail = []
     for r in rows:
         downtime = _downtime_h(r.get("START_DATE"), r.get("END_DATE"), r.get("PRODUCTION_DAY"))
         gas, cond = _float_or_none(r.get("DEFERRED_GAS_VOL_SM3")), _float_or_none(r.get("DEFERRED_COND_VOL_STM3"))
         detail.append({"well": r.get("WELL_NAME"), "day": str(r.get("PRODUCTION_DAY"))[:10], "downtime_h": downtime,
                        "gas": gas, "cond": cond, "END_DATE": r.get("END_DATE") or ""})
-        if downtime > 0:
-            w = rates.setdefault(str(r.get("WELL_NAME")), {"gas": [], "cond": []})
-            if gas is not None:
-                w["gas"].append(gas * 24 / downtime)
-            if cond is not None:
-                w["cond"].append(cond * 24 / downtime)
     detail.sort(key=lambda x: (x["well"] or "", x["day"]))
 
     result = {
@@ -482,12 +644,77 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
         "wells": wells,
         "rows": detail,
         "missing": missing,
-        "rate_per_well": {w: {k: (round(statistics.median(v), 2) if v else None) for k, v in r.items()}
-                          for w, r in rates.items()},
+        "rate_per_well": _rate_per_well(rows),
     }
     if ends:
         result["rows_without_end_date"] = [{"well": x["well"], "day": x["day"]} for x in detail if not x["END_DATE"]]
+    if fn.event_key.startswith("G_"):
+        result["missing_wells"] = _group_missing_wells(wrfm, set(wells), first_day, last_day)
+        for mw in result["missing_wells"]:
+            missing += [{"well": mw["well"], "day": d} for d in mw["days"]]
     return result
+
+
+def _group_missing_wells(wrfm: WrfmClient, event_wells: set[str], first_day: date, last_day: date) -> list[dict]:
+    """Wells without rows in a group event that were producing and not closed or deferred in its window."""
+    days = []
+    d = first_day
+    while d <= last_day:
+        days.append(d.isoformat())
+        d += timedelta(days=1)
+    all_wells = sorted({str(r.get("WELL_NAME")) for r in _select_all(wrfm, "well_info")} - {"None", ""})
+    found = []
+    for well in all_wells:
+        if well in event_wells:
+            continue
+        cond = [WrfmCondition(field_name="WELL_NAME", operator="eq", value=well)]
+        status = []
+        for s in _select_all(wrfm, "well_status_history", cond):
+            s_start = str(s.get("STATUS_DATE") or "")[:10]
+            s_end = str(s.get("STATUS_END_DATE") or "")[:10]
+            if s_start and s_start <= days[-1] and (not s_end or s_end >= days[0]):
+                status.append(s)
+        closed_cover = any(str(s.get("STATUS_DESC", "")).upper().startswith("CLOSED")
+                           and str(s.get("STATUS_DATE"))[:10] <= days[0]
+                           and (not str(s.get("STATUS_END_DATE") or "").strip()
+                                or str(s.get("STATUS_END_DATE"))[:10] >= days[-1]) for s in status)
+        other = [r for r in _select_all(wrfm, "deferments", cond) if str(r.get("PRODUCTION_DAY"))[:10] in days]
+        alloc = {str(p.get("REPORT_DAY"))[:10]: _float_or_none(p.get("ALLOC_GAS_SM3"))
+                 for p in _select_all(wrfm, "daily_production", cond) if str(p.get("REPORT_DAY"))[:10] in days}
+        producing = any((v or 0) > 0 for v in alloc.values())
+        if not closed_cover and not other and producing:
+            found.append({
+                "well": well,
+                "days": days,
+                "evidence": {
+                    "status_intervals_in_window": [{k: s.get(k) for k in ("STATUS_DESC", "STATUS_DATE", "STATUS_END_DATE")}
+                                                   for s in status],
+                    "other_deferment_rows_in_window": len(other),
+                    "alloc_gas_on_event_days": alloc,
+                },
+            })
+    return found
+
+
+def _enrich_refs(fn: Req_WrfmRespond, state) -> tuple[Req_WrfmRespond, list[dict]]:
+    """Drop refs never seen in this task; add a table ref for every table used. Never adds wiki refs."""
+    task_lower = state.task_text.lower()
+    kept, dropped = [], []
+    for ref in fn.ground_refs:
+        rid = str(ref.id)
+        if ref.type == "wiki":
+            ok = rid in state.loaded_docs
+        elif ref.type == "table":
+            ok = rid in state.used_tables
+        elif ref.type in ("well", "deferment_event"):
+            ok = rid in state.seen_ids or rid.lower() in task_lower
+        else:
+            ok = True
+        (kept if ok else dropped).append(ref)
+    cited_tables = {str(r.id) for r in kept if r.type == "table"}
+    for table in sorted(state.used_tables - cited_tables):
+        kept.append(WrfmGroundRef(type="table", id=table, label=table))
+    return fn.model_copy(update={"ground_refs": kept}), [r.model_dump(exclude_none=True) for r in dropped]
 
 
 TREE_CHARS = "│├└─|`+-– \t"
@@ -601,6 +828,7 @@ def run_agent(
     finally:
         if not state.responded:
             _send_fallback_respond(wrfm, state.reason)
+            _trace(state, {"final_respond": {"message": state.reason, "outcome": "error_internal"}, "fallback": True})
 
 
 def _run_agent_loop(
@@ -615,7 +843,17 @@ def _run_agent_loop(
     print(f"\n{CLI_CYAN}Task: {task.spec_id}{CLI_CLR}")
     print(f"  {task.task_text}\n")
 
+    try:
+        trace_dir = Path(__file__).resolve().parent / "runs" / "traces"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        state.trace_path = trace_dir / f"{task.spec_id}_{stamp}.jsonl"
+    except Exception:
+        state.trace_path = None
+    _trace(state, {"task": task.spec_id, "task_text": task.task_text})
+
     bootstrap_log = _bootstrap(wrfm, state)
+    _trace(state, {"bootstrap": [{"label": label, "text": text} for label, text in bootstrap_log]})
 
     log: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -629,6 +867,10 @@ def _run_agent_loop(
                 state.recommended = {
                     table: set(info.get("recommended_filters", [])) for table, info in tables.items()
                 }
+                for table, info in tables.items():
+                    fields = info.get("fields") or {}
+                    state.required[table] = [f for f, spec in fields.items() if spec.get("required")]
+                    state.enums[table] = {f: spec["enum"] for f, spec in fields.items() if spec.get("enum")}
             except Exception:
                 state.recommended = {}
         elif label == "system":
@@ -707,7 +949,10 @@ def _run_agent_loop(
         })
 
         dispatch_ok = False
-        block = _write_block_reason(fn, state)
+        block = _write_block_reason(fn, state, wrfm)
+        dropped_refs = []
+        if isinstance(fn, Req_WrfmRespond):
+            fn, dropped_refs = _enrich_refs(fn, state)
         if isinstance(fn, (LocalCalc, LocalAggregate, LocalDowntime, LocalEventCheck)):
             try:
                 if isinstance(fn, LocalCalc):
@@ -720,6 +965,11 @@ def _run_agent_loop(
                     local = _local_event_check(wrfm, fn, state)
             except Exception as exc:
                 local = {"error": str(exc), "code": "local_tool_error"}
+            if isinstance(fn, LocalAggregate) and "error" not in local:
+                state.used_tables.add(fn.table_name)
+            if isinstance(fn, LocalEventCheck) and "error" not in local:
+                state.used_tables.add("deferments")
+            _collect_ids(local, state)
             result_text = json.dumps(local)
             style = CLI_RED if "error" in local else CLI_GREEN
             print(f"    {style}->{CLI_CLR} {result_text[:200]}")
@@ -729,9 +979,10 @@ def _run_agent_loop(
         else:
             note = ""
             to_send = fn
-            if isinstance(fn, Req_WrfmDataSelect) and fn.order_by:
-                to_send = fn.model_copy(update={"order_by": None})
-                note = ORDER_BY_NOTE + "\n"
+            if isinstance(fn, Req_WrfmDataSelect) and fn.order_by and len(fn.order_by.split()) > 1:
+                order_field = fn.order_by.split()[0]  # bare field name only; direction is not supported
+                to_send = fn.model_copy(update={"order_by": order_field})
+                note = ORDER_BY_NOTE.format(field=order_field) + "\n"
             try:
                 result = wrfm.dispatch(to_send)
                 result_text = result.model_dump_json(exclude_none=True)
@@ -743,6 +994,11 @@ def _run_agent_loop(
                     _track_owners(getattr(result, "rows", []) or [], state)
                 if isinstance(fn, Req_WrfmDataCreate):
                     state.create_keys.add(_create_key(fn, state))
+                if isinstance(fn, (Req_WrfmDataSelect, Req_WrfmDataCreate, Req_WrfmDataUpdate)):
+                    state.used_tables.add(fn.table_name)
+                    _collect_ids(getattr(result, "rows", []) or [], state)
+                if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)):
+                    state.event_rows.clear()  # rows changed; refetch on next guard check
             except ApiException as exc:
                 result_text = exc.api_error.model_dump_json(exclude_none=True)
                 print(f"    {CLI_RED}ERR: {exc.api_error.error}{CLI_CLR}")
@@ -752,8 +1008,16 @@ def _run_agent_loop(
             result_text = note + result_text
 
         log.append({"role": "tool", "content": f"RESULT of {fn_type}: {result_text}", "tool_call_id": step_id})
+        _trace(state, {
+            "step": i + 1, "current_state": step.current_state, "plan": step.plan, "function": fn_type,
+            "args": json.loads(fn.model_dump_json(exclude_none=True)), "result": result_text,
+            "block": block if not isinstance(fn, (LocalCalc, LocalAggregate, LocalDowntime, LocalEventCheck)) else None,
+            "dropped_refs": dropped_refs, "elapsed_ms": elapsed_ms,
+            "tokens": {"prompt": prompt_tokens, "cached": cached_prompt_tokens, "completion": completion_tokens},
+        })
 
         if isinstance(fn, Req_WrfmRespond):
+            _trace(state, {"final_respond": json.loads(fn.model_dump_json(exclude_none=True)), "dispatch_ok": dispatch_ok})
             if dispatch_ok:
                 state.responded = True
             else:

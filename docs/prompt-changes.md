@@ -110,3 +110,48 @@ New:
 - fix-002 `wrfm_def_005`: Operations Supervisor closed an event (now blocked in code by the RACI authority guard).
 
 **Specs to re-check:** all (`wrfm_def_001` to `wrfm_def_010`).
+
+## P-003 (2026-10-11, fix-004)
+
+**Rule 4, closing bullet: prepended**
+
+```
+Only when the task states the restart/end time explicitly.
+```
+
+Now reads: `- Closing an event: Only when the task states the restart/end time explicitly. Run local_event_check first. ...`
+
+**Rule 4, new-event bullet: replaced**
+
+Old:
+
+```
+Leave fields empty that the task and data do not give, unless they are in the guide's minimum information.
+```
+
+New:
+
+```
+Fill every required field. For a new event choose the closest approved labels (cause, system group, activity owner) from the guide. For a row of an existing event copy them.
+```
+
+**Rule 3: added**
+
+```
+   For a group event (G_ key), also create rows for missing_wells reported by local_event_check.
+```
+
+**Evidence**
+
+- `data_schema` marks every deferments field required except COMMENTS and END_DATE, including DEFER_ACTIVITY_OWNER (with enum lists).
+
+**Reason**
+
+- fix-003 `wrfm_def_009`: closed the event with an invented END_DATE (today 00:00) when the task gave no restart time.
+- fix-003 `wrfm_def_006`: create retried without DEFER_ACTIVITY_OWNER and was rejected (`missing_required_field`); the agent then asked the user.
+- fix-003 `wrfm_def_002`: create rejected 4 times with `missing_required_field`.
+- fix-003 `wrfm_def_010`: group event review missed a create for an affected well without rows.
+
+No change for `wrfm_def_004` (pending investigation).
+
+**Specs to re-check:** all (`wrfm_def_001` to `wrfm_def_010`).
