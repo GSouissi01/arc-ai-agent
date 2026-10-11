@@ -52,7 +52,7 @@ for m in misses:
     print("  MISS", m)
 print(f"  exact {ok}/38, within 0.01 {near}/38")
 check("H1' via code path: 38/38 within 0.01 (validator tolerance)", near == len(DATA["deferments"]) == 38)
-check("write values == stored on 37/38 rows (Python round; 1 known source double-rounding row)", ok == 37)
+check("write values == stored on all 38 rows (_volume: round(R*seconds/86400, 2))", ok == 38)
 
 # 2) 001: missing day 2025-10-14 of ongoing W_WELL-03_2025-10-13-1 -> 2,380,000.00 / 35.80 exactly
 est = agent._volume_estimate(w, "WELL-03", "2025-10-13T22:25:00", None, "2025-10-14", "DOWN")

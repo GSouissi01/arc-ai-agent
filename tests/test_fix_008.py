@@ -55,7 +55,7 @@ for r in T["deferments"]:
     e = agent._volume_estimate(DW(T), r["WELL_NAME"], r["START_DATE"], r.get("END_DATE") or None, r["PRODUCTION_DAY"], r["EVENT_TYPE"])
     ok += e["write_gas"] == round(float(r["DEFERRED_GAS_VOL_SM3"]), 2) and e["write_cond"] == round(float(r["DEFERRED_COND_VOL_STM3"]), 2)
 print(f"  stored rows matched: {ok}/{len(T['deferments'])}")
-check("stored rows: 37/38 (1 known source double-rounding row)", ok == 37 and len(T["deferments"]) == 38)
+check("stored rows: 38/38", ok == 38 and len(T["deferments"]) == 38)
 
 # 2) am/pm naive rule
 def hours(text, day="2025-11-11"):

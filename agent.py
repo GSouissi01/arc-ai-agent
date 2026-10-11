@@ -670,8 +670,24 @@ def _window_hours_on_day(window: tuple[datetime, datetime], production_day: str)
     return max(overlap, 0.0)
 
 
+def _span_on_day(start_dt: datetime, end_dt: datetime | None, production_day) -> tuple[datetime, datetime]:
+    """[start, end) clipped to [production_day 00:00, +24h); no end = ongoing (end of day)."""
+    day_start = datetime.fromisoformat(str(production_day).strip()[:10])
+    day_end = day_start + timedelta(days=1)
+    s, e = max(start_dt, day_start), min(end_dt or day_end, day_end)
+    return s, max(e, s)
+
+
+def _volume(rate: float, start_dt: datetime, end_dt: datetime) -> float:
+    """Deferred volume of one row: round(R * seconds / 86400, 2), evaluated in exactly that order.
+
+    Inferred from data (38/38 stored rows, evaluator 46.8 x 14.5 h -> 28.27); not a confirmed evaluator rule.
+    """
+    return round(rate * (end_dt - start_dt).total_seconds() / 86400, 2)
+
+
 def _round2(value: float) -> float:
-    """Python round() to 2 decimals on the unrounded value (matches the evaluator: 46.8 x 14.5 / 24 -> 28.27)."""
+    """Python round() to 2 decimals (write values; DOWN volumes come already rounded from _volume)."""
     return round(value, 2)
 
 
@@ -690,12 +706,12 @@ def _volume_estimate(wrfm: WrfmClient, well, start, end, production_day, event_t
 
 def _volume_estimate_raw(wrfm: WrfmClient, well, start, end, production_day, event_type,
                          event_rows: list[dict] | None = None, cache: dict | None = None, task_text: str = "") -> dict:
-    """Deferred volumes of one (well, production day) row (unrounded).
+    """Deferred volumes of one (well, production day) row (DOWN methods via _volume; clean_day_diff unrounded).
 
     R = the well's ALLOC on the last clean day before the event start (no deferment row for that well that day).
-    DOWN:       times stated in the task -> R x stated_hours_on_day / 24        (clean_day_stated_hours)
-                else R x event-span hours inside the production day / 24       (clean_day_span_hours)
-                no clean day: best R from the event's rows x span hours / 24   (best_R_fallback)
+    DOWN:       times stated in the task -> _volume(R, stated window on the day)   (clean_day_stated_hours)
+                else _volume(R, event span inside the production day)          (clean_day_span_hours)
+                no clean day: _volume(best R from the event's rows, span)      (best_R_fallback)
     CONSTRAINT: day has daily_production -> R - ALLOC(day)                     (clean_day_diff)
     Otherwise: no method -> clarification.
     """
@@ -725,19 +741,22 @@ def _volume_estimate_raw(wrfm: WrfmClient, well, start, end, production_day, eve
         window = _stated_window(task_text, start_day)
         stated = _window_hours_on_day(window, day) if window else 0.0
         if stated > 0:
+            s, e = _span_on_day(window[0], window[1], day)
             return dict(out, method="clean_day_stated_hours", downtime_h=stated,
                         stated_end=window[1].isoformat(timespec="seconds"),
-                        deferred_gas=r_gas * stated / 24, deferred_cond=r_cond * stated / 24)
+                        deferred_gas=_volume(r_gas, s, e), deferred_cond=_volume(r_cond, s, e))
         hours = _downtime_h(start, end, day, exact=True)
+        s, e = _span_on_day(_parse_dt(start), _parse_dt(end), day)
         return dict(out, method="clean_day_span_hours", downtime_h=hours,
-                    deferred_gas=r_gas * hours / 24, deferred_cond=r_cond * hours / 24)
+                    deferred_gas=_volume(r_gas, s, e), deferred_cond=_volume(r_cond, s, e))
     if not constraint and event_rows:
         rate = _rate_per_well(event_rows).get(str(well))
         if rate and rate.get("gas") is not None:
             hours = _downtime_h(start, end, day, exact=True)
+            s, e = _span_on_day(_parse_dt(start), _parse_dt(end), day)
             return dict(base, method="best_R_fallback", R_gas=rate["gas"], R_cond=rate.get("cond") or 0.0,
-                        downtime_h=hours, deferred_gas=rate["gas"] * hours / 24,
-                        deferred_cond=(rate.get("cond") or 0.0) * hours / 24)
+                        downtime_h=hours, deferred_gas=_volume(rate["gas"], s, e),
+                        deferred_cond=_volume(rate.get("cond") or 0.0, s, e))
     return dict(base, clarification_needed="no clean production day before the event start: ask for the volumes")
 
 

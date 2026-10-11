@@ -320,3 +320,15 @@ No prompt text changed.
 **Unchanged:** 004 and 010 stay parked.
 
 **Specs to re-check:** all.
+
+## P-008b (2026-10-11, fix-008b): volume = round(R * seconds / 86400, 2) on every path
+
+No prompt text changed.
+
+**Formula (code):** one helper `_volume(R, start_dt, end_dt) = round(R * (end_dt - start_dt).total_seconds() / 86400, 2)`, evaluated in exactly that order ((R * seconds) / 86400, no hours or minutes step). Every DOWN volume path goes through it: clean_day_stated_hours (stated window datetimes clipped to the production day), clean_day_span_hours and best_R_fallback (event span clipped to the production day). The write values and the volume validator read the same result. clean_day_diff (CONSTRAINT) and group_peer_fraction are unchanged.
+
+**Evidence:** 38/38 stored rows match at 2 decimals (fix-008's R x hours / 24 gave 37/38; the miss G_NOVA7_2025-09-11-1 WELL-02 condensate is an exact tie 36.725 that this order rounds to 36.73), and the evaluator's 46.8 x 14.5 h case gives 28.27. The tie direction depends on the float result of (R * seconds) / 86400; R * (seconds / 86400) or R x hours / 24 rounds both ties down.
+
+**Status:** inferred from data, not a confirmed evaluator rule.
+
+**Specs to re-check:** all.
