@@ -1258,6 +1258,43 @@ def _blocked_write_block(fn: Req_WrfmRespond, state) -> str | None:
     return f"BLOCKED WRITE: {guard} -> respond none_clarification_needed asking for {missing}, cite the event and well"
 
 
+_ONLY_FIGURE = re.compile(r"\bonly\b.*\b(figure|number|value|volume)\b|\b(figure|number|value|volume)\b.*\bonly\b",
+                          re.IGNORECASE)
+_BARE_NUMBER = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _raw_event_figure(fn: Req_WrfmRespond, state, wrfm: WrfmClient | None) -> Req_WrfmRespond | None:
+    """EXPERIMENTAL (P-012). Answer-only figure equal to an event's stored gas/cond sum -> the unrounded sum over its
+    rows of R * span seconds / 86400 (Python repr). None (keep the answer) unless every row has a clean-day R and a
+    span whose 2-decimal _volume equals the stored value."""
+    message = (fn.message or "").strip()
+    if (wrfm is None or fn.outcome != "ok_answer" or not _BARE_NUMBER.match(message)
+            or not _ONLY_FIGURE.search(state.task_text)):
+        return None
+    for ref in fn.ground_refs:
+        if ref.type != "deferment_event":
+            continue
+        rows = _select_all(wrfm, "deferments", [WrfmCondition(field_name="EVENT_KEY", operator="eq", value=str(ref.id))])
+        for vol_field, rate_key in (("DEFERRED_GAS_VOL_SM3", "R_gas"), ("DEFERRED_COND_VOL_STM3", "R_cond")):
+            stored = [_float_or_none(r.get(vol_field)) for r in rows]
+            if not rows or None in stored or round(sum(stored), 2) != float(message):
+                continue
+            raw, cache = [], {}
+            for r, value in zip(rows, stored):
+                try:
+                    est = _volume_estimate_raw(wrfm, r.get("WELL_NAME"), r.get("START_DATE"), r.get("END_DATE") or None,
+                                               r.get("PRODUCTION_DAY"), r.get("EVENT_TYPE"), rows, cache)
+                    s, e = _span_on_day(_parse_dt(r.get("START_DATE")), _parse_dt(r.get("END_DATE")), r.get("PRODUCTION_DAY"))
+                except (TypeError, ValueError):
+                    return None
+                rate = est.get(rate_key)
+                if est.get("method") != "clean_day_span_hours" or not rate or _volume(rate, s, e) != round(value, 2):
+                    return None
+                raw.append(rate * (e - s).total_seconds() / 86400)
+            return fn.model_copy(update={"message": repr(sum(raw))})
+    return None
+
+
 def _enrich_refs(fn: Req_WrfmRespond, state) -> tuple[Req_WrfmRespond, list[dict]]:
     """Drop refs never seen in this task; add a table ref for every table used. Never adds wiki refs."""
     task_lower = state.task_text.lower()
@@ -1571,6 +1608,11 @@ def _run_agent_loop(
             respond_block = (_respond_block_reason(fn, state) or _blocked_write_block(fn, state)
                              or _event_check_block(fn, state, step.current_state))
             block = block or respond_block
+            if not block:
+                raw_fn = _raw_event_figure(fn, state, wrfm)
+                if raw_fn is not None:
+                    _trace(state, {"raw_event_figure": {"stored": fn.message, "raw": raw_fn.message}})
+                    fn = raw_fn
         if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)) and block and _clarify_guard(block):
             state.clarify_blocks.append(_clarify_guard(block))
         if isinstance(fn, (LocalCalc, LocalAggregate, LocalDowntime, LocalEventCheck, LocalVolumeEstimate)):
