@@ -982,7 +982,34 @@ _DATE_IN_TEXT = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _CHECK_WORDING = re.compile(r"\b(review|correct|check|reconcile|fix)\b", re.IGNORECASE)
 
 
+_PHRASE_WORD = re.compile(r"[a-z0-9]+(?:['-][a-z0-9]+)*")
+_PHRASE_STOP = {"the", "a", "an", "of", "for", "to", "in", "on", "at", "and", "or", "with", "by", "from", "is", "was",
+                "be", "this", "that", "event", "events", "related", "deferment", "deferments", "record"}
+
+
+def _comments_event_key(wrfm: WrfmClient, text: str) -> str | None:
+    """The one event whose COMMENTS contain the longest task phrase (>= 3 words, >= 2 content words), whole words."""
+    words = _PHRASE_WORD.findall((text or "").lower())
+    rows = [r for r in _select_all(wrfm, "deferments") if r.get("COMMENTS") and r.get("EVENT_KEY")]
+    for n in range(len(words), 2, -1):
+        keys = set()
+        for i in range(len(words) - n + 1):
+            gram = words[i:i + n]
+            if sum(w not in _PHRASE_STOP for w in gram) < 2:
+                continue
+            pattern = re.compile(r"\b" + r"\s+".join(map(re.escape, gram)) + r"\b", re.IGNORECASE)
+            keys |= {str(r["EVENT_KEY"]) for r in rows if pattern.search(str(r["COMMENTS"]))}
+        if keys:
+            return keys.pop() if len(keys) == 1 else None
+    return None
+
+
 def _task_event_key(wrfm: WrfmClient, state) -> str | None:
+    """The event the task describes: a unique COMMENTS phrase match first, else the named-event logic."""
+    return _comments_event_key(wrfm, state.task_text) or _named_event_key(wrfm, state)
+
+
+def _named_event_key(wrfm: WrfmClient, state) -> str | None:
     """The event the task names: an EVENT_KEY in the text, or one well + a date that resolve to exactly one event."""
     match = _EVENT_KEY_IN_TEXT.search(state.task_text)
     if match:

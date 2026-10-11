@@ -332,3 +332,11 @@ No prompt text changed.
 **Status:** inferred from data, not a confirmed evaluator rule.
 
 **Specs to re-check:** all.
+
+## P-009a (2026-10-11, fix-009a): bootstrap event pick by COMMENTS phrase
+
+No prompt text changed.
+
+**Code:** `_task_event_key` first looks for the one event whose COMMENTS contain the longest task phrase (whole words, case-insensitive, >= 3 words with >= 2 content words). An ambiguous or absent match falls back to the previous logic (EVENT_KEY in the text, or one well + a date).
+
+**Evidence:** a review task worded "the event related to export pressure control problems" picked a different group event in one run (label search on system group "export"). Offline replay of the 22 fix-008b traces on the snapshot: selection unchanged for 001-009, 010 now resolves to the export pressure control event (previously none).
