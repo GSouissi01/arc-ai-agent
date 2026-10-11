@@ -391,11 +391,3 @@ No prompt text changed.
 **Evidence:** a close task with no time and two open events ("Close the open deferment record.") scored "expected no write actions got 1": the agent created a missing day row of another open event before its END_DATE update was blocked. Replay of all fix-008b / fix-009 / fix-010 close-intent runs (19): no passing run wrote under close + no time; the only run the guard would block is that failing one.
 
 **Known limit:** intent detection is keyword-based, so a non-close task whose text contains a close word (e.g. "restart") and no time is also treated as close.
-
-## P-012 (2026-10-11, fix-012): raw event figure for answer-only responses — EXPERIMENTAL, revert if 004 fails
-
-No prompt text changed.
-
-**Code:** an ok_answer on an "only ... figure/number/value/volume" task whose message is a bare number equal (2 decimals) to the stored gas or condensate sum of a cited deferment event is replaced by the unrounded sum over that event's rows of R x span seconds / 86400 (Python repr; R = clean-day rate, span = row window inside its production day). Falls back to the agent's answer unless every row uses the clean-day span method and its 2-decimal `_volume` equals the stored value.
-
-**Evidence:** the largest-event gas answer `14717986.11` (stored-row sum, same in every float order) scored 0 in every run; the unrounded recompute is `14717986.111111112`. Replay of all 121 traced final answers: only the largest-event task is eligible; no writes change.
