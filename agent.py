@@ -6,10 +6,12 @@ over the WRFM API request models. WrfmClient.dispatch() handles routing.
 """
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 import json
+import operator
 import time
-from typing import Annotated, List, Union
+from typing import Annotated, List, Literal, Optional, Union
 
 from annotated_types import MaxLen, MinLen
 from openai import BadRequestError, OpenAI
@@ -26,6 +28,7 @@ from ogchallenge_client.dtos import (
     Req_WrfmDataSelect,
     Req_WrfmDataUpdate,
     Req_WrfmRespond,
+    WrfmCondition,
 )
 
 CLI_GREEN = "\x1b[32m"
@@ -55,6 +58,24 @@ def make_llm_client(config: LLMConfig) -> OpenAI:
     return OpenAI(**kwargs)
 
 
+class LocalCalc(BaseModel):
+    """Local arithmetic tool, evaluated in code and never sent to ARC."""
+
+    type: Literal["local_calc"]
+    expression: str = Field(..., description="Arithmetic only: numbers, + - * / ( ). Example: 2380000 * 14.75 / 24")
+
+
+class LocalAggregate(BaseModel):
+    """Local aggregation over one flat table, computed in code (pages data_select internally)."""
+
+    type: Literal["local_aggregate"]
+    table_name: str
+    where_clause: List[WrfmCondition] = Field(default_factory=list)
+    group_by: Optional[str] = Field(None, description="Field to group by, e.g. EVENT_KEY; null = whole selection")
+    value_field: str
+    op: Literal["sum", "max", "min", "avg", "count"]
+
+
 Action = Union[
     Req_System,
     Req_WikiTree,
@@ -65,6 +86,8 @@ Action = Union[
     Req_WrfmDataCreate,
     Req_WrfmDataUpdate,
     Req_WrfmRespond,
+    LocalCalc,
+    LocalAggregate,
 ]
 
 DiscriminatedAction = Annotated[
@@ -136,7 +159,27 @@ Outcome codes:
 Always check necessary governance documents before write actions.
 Use deferment guidelines for deferment event and production-day rules.
 Use extensive ground refs to reference the exact source of your knowledge and authority, especially for write actions.
-Do not mutate records when the task asks only for review, anomaly checking, or clarification.
+
+All wiki documents are already loaded above. Base every decision on them.
+
+Decision checklist (follow in order):
+1. Authority: find your role in [system]. The RACI in governance/raci.md says which role may create, close or update deferment rows. If your role may not do the requested write, respond denied_security and write nothing.
+2. Clarify instead of guessing. Respond none_clarification_needed when:
+   - several records match and the task does not say which one;
+   - a value the write needs is missing and cannot be derived from the data or the wiki (for example, closing an event when no restart or end time is given);
+   - the task asks you to set a value through a rule the wiki does not state. DEFER_ACTIVITY_OWNER is the accountable discipline; never infer it from the cause or from your own role.
+   Never ask the user for values you can derive yourself: deferred volumes, event key, or event attributes copied from existing rows.
+3. Write only when the task asks for a change. A review or check task writes only if it also asks you to correct data, and only where the data breaks a wiki rule.
+4. Deferment rules:
+   - One row per production day per event. Event-level fields are identical across the event's rows.
+   - Adding a missing day row for an existing event: copy EVENT_KEY, START_DATE, cause, system group, category, event type, asset type and activity owner from that event's existing rows.
+   - New event: build EVENT_KEY exactly as the deferment guide says, matching the format of existing keys. Use approved labels only, choosing the closest approved label for the stated cause and system. Leave fields empty that the task and data do not give, unless they are in the guide's minimum information.
+   - Closing an event: set the same END_DATE on every row of the event, and make sure a row exists for every production day from the start day to the end day; create the missing ones.
+   - Deferred volumes = daily rate × (downtime hours inside that production day ÷ 24). Get the daily rate from an existing full-day row of the same event if one exists, otherwise from the well's daily_production before the event. Compute with local_calc. Never write 0 or a placeholder volume.
+5. Each step executes its function immediately. A create or update that returned a row is done; never repeat it.
+6. Data: select one table at a time. Do not use order_by. Use local_aggregate for totals, maximums and per-event sums, and local_calc for every arithmetic step. Never do arithmetic in your head.
+7. Tool errors: read the error and change the call. Never repeat an identical failing call. A tool error is never a reason for denied_security or none_unsupported.
+8. Ground refs: cite wiki docs by full path, tables by name, wells by WELL_NAME, and deferment events by EVENT_KEY. Cite only items you actually used in this task.
 """
 
 MAX_STEPS = 30
@@ -174,6 +217,112 @@ def _write_block_reason(fn, state):
         return ("DUPLICATE WRITE BLOCKED: this row was already created earlier in this task. "
                 "Do not repeat it. Verify with a select, or respond.")
     return None
+
+
+ORDER_BY_NOTE = ("NOTE: order_by is not supported and was removed; rows are unsorted. "
+                 "Use local_aggregate for max/min/sum.")
+
+_CALC_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+
+
+def _calc_node(node: ast.AST) -> float:
+    if isinstance(node, ast.Expression):
+        return _calc_node(node.body)
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and type(node.op) in _CALC_OPS:
+        return _CALC_OPS[type(node.op)](_calc_node(node.left), _calc_node(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_calc_node(node.operand)
+    raise ValueError(f"unsupported element: {type(node).__name__}")
+
+
+def _local_calc(expression: str) -> dict:
+    """Evaluate arithmetic only (numbers, + - * /, unary minus, parentheses)."""
+    try:
+        result = _calc_node(ast.parse(expression, mode="eval"))
+    except ZeroDivisionError:
+        return {"error": "division by zero", "code": "local_calc_error"}
+    except (SyntaxError, ValueError) as exc:
+        return {"error": f"local_calc accepts arithmetic only: {exc}", "code": "local_calc_error"}
+    return {"result": result, "rounded_2dp": round(result, 2)}
+
+
+def _local_aggregate(wrfm: WrfmClient, fn: LocalAggregate) -> dict:
+    """Page through data_select and compute op per group in Python."""
+    fields = [fn.group_by, fn.value_field] if fn.group_by else [fn.value_field]
+    rows: list[dict] = []
+    offset = 0
+    try:
+        while True:
+            page = wrfm.data_select(fn.table_name, fields=fields, where_clause=fn.where_clause,
+                                    limit=1000, offset=offset)
+            rows.extend(page.rows)
+            if page.next_offset == -1 or page.next_offset <= offset:
+                break
+            offset = page.next_offset
+    except ApiException as exc:
+        return json.loads(exc.api_error.model_dump_json(exclude_none=True))
+
+    groups: dict[str, dict] = {}
+    for row in rows:
+        key = str(row.get(fn.group_by)) if fn.group_by else "(all)"
+        g = groups.setdefault(key, {"rows": 0, "values": []})
+        g["rows"] += 1
+        raw = row.get(fn.value_field)
+        if raw is None or str(raw).strip() == "":
+            continue
+        if fn.op == "count":
+            g["values"].append(1.0)
+            continue
+        try:
+            g["values"].append(float(raw))
+        except (TypeError, ValueError):
+            continue
+
+    def compute(values: list[float]) -> float | None:
+        if fn.op == "count":
+            return float(len(values))
+        if not values:
+            return None
+        if fn.op == "sum":
+            return sum(values)
+        if fn.op == "max":
+            return max(values)
+        if fn.op == "min":
+            return min(values)
+        return sum(values) / len(values)
+
+    result = [{"group": k, "value": compute(g["values"]), "rows": g["rows"]} for k, g in groups.items()]
+    result.sort(key=lambda r: (r["value"] is not None, r["value"] or 0.0), reverse=True)
+    return {"groups": result[:20], "top": result[0] if result else {}, "total_rows": len(rows)}
+
+
+TREE_CHARS = "│├└─|`+-– \t"
+
+
+def _tree_paths(tree: str) -> list[str]:
+    """Best-effort parse of a wiki_tree string into full paths."""
+    paths: list[str] = []
+    stack: list[str] = []
+    entries = []
+    for line in tree.splitlines():
+        stripped = line.lstrip(TREE_CHARS)
+        name = stripped.strip()
+        if name and name not in {".", "./"}:  # skip blank lines and the root marker
+            entries.append((len(line) - len(stripped), name))
+    base = min((indent for indent, _ in entries), default=0)
+    for indent, name in entries:
+        if "/" in name.rstrip("/"):  # already a full path
+            paths.append(name.rstrip("/"))
+            continue
+        depth = (indent - base) // 4
+        stack = stack[:depth]
+        full = "/".join(stack + [name.rstrip("/")])
+        paths.append(full)
+        if name.endswith("/") or "." not in name:
+            stack.append(name.rstrip("/"))
+    return paths
 
 
 def _call_llm(
@@ -274,7 +423,7 @@ def _run_agent_loop(
     print(f"\n{CLI_CYAN}Task: {task.spec_id}{CLI_CLR}")
     print(f"  {task.task_text}\n")
 
-    bootstrap_log = _bootstrap(wrfm)
+    bootstrap_log = _bootstrap(wrfm, state)
 
     log: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -358,12 +507,25 @@ def _run_agent_loop(
 
         dispatch_ok = False
         block = _write_block_reason(fn, state)
-        if block:
+        if isinstance(fn, (LocalCalc, LocalAggregate)):
+            try:
+                local = _local_calc(fn.expression) if isinstance(fn, LocalCalc) else _local_aggregate(wrfm, fn)
+            except Exception as exc:
+                local = {"error": str(exc), "code": "local_tool_error"}
+            result_text = json.dumps(local)
+            style = CLI_RED if "error" in local else CLI_GREEN
+            print(f"    {style}->{CLI_CLR} {result_text[:200]}")
+        elif block:
             result_text = json.dumps({"error": block, "code": "blocked_by_agent_guard"})
             print(f"    {CLI_RED}BLOCKED: {block}{CLI_CLR}")
         else:
+            note = ""
+            to_send = fn
+            if isinstance(fn, Req_WrfmDataSelect) and fn.order_by:
+                to_send = fn.model_copy(update={"order_by": None})
+                note = ORDER_BY_NOTE + "\n"
             try:
-                result = wrfm.dispatch(fn)
+                result = wrfm.dispatch(to_send)
                 result_text = result.model_dump_json(exclude_none=True)
                 dispatch_ok = True
                 print(f"    {CLI_GREEN}->{CLI_CLR} {result_text[:200]}")
@@ -377,6 +539,7 @@ def _run_agent_loop(
             except Exception as exc:
                 result_text = f'{{"error": "{exc}"}}'
                 print(f"    {CLI_RED}ERR: {exc}{CLI_CLR}")
+            result_text = note + result_text
 
         log.append({"role": "tool", "content": f"RESULT of {fn_type}: {result_text}", "tool_call_id": step_id})
 
@@ -395,8 +558,9 @@ def _run_agent_loop(
         print(f"\n  {CLI_YELLOW}Reached max steps ({MAX_STEPS}) without responding.{CLI_CLR}")
 
 
-def _bootstrap(wrfm: WrfmClient) -> list[tuple[str, str]]:
+def _bootstrap(wrfm: WrfmClient, state: _TaskState) -> list[tuple[str, str]]:
     results = []
+    wiki_paths: list[str] = []
 
     try:
         system = wrfm.system()
@@ -407,6 +571,7 @@ def _bootstrap(wrfm: WrfmClient) -> list[tuple[str, str]]:
     try:
         wiki = wrfm.wiki_tree()
         results.append(("wiki_tree", wiki.tree))
+        wiki_paths = [p for p in _tree_paths(wiki.tree) if p.endswith(".md")]
     except Exception as exc:
         results.append(("wiki_tree", f"error: {exc}"))
 
@@ -415,5 +580,14 @@ def _bootstrap(wrfm: WrfmClient) -> list[tuple[str, str]]:
         results.append(("data_schema", schema.model_dump_json()))
     except Exception as exc:
         results.append(("data_schema", f"error: {exc}"))
+
+    # Load the whole wiki up front (pages are small) so every decision can cite it.
+    for path in wiki_paths:
+        try:
+            page = wrfm.dispatch(Req_WikiLoad(path=path))
+            results.append((f"wiki:{path}", page.content))
+            state.loaded_docs.add(path)
+        except Exception as exc:
+            results.append((f"wiki:{path}", f"error: {exc}"))
 
     return results

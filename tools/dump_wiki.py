@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from main import BENCHMARK_ID, _build_platform_client  # noqa: E402  (loads .env)
 from ogchallenge_client import ApiException, WrfmClient  # noqa: E402
+from agent import _tree_paths  # noqa: E402  (shared wiki tree parser)
 
 PAGES = [
     "deferment/deferment_guide.md",
@@ -30,31 +31,6 @@ PAGES = [
 ]
 PREFIX = "sy"  # truncated entry seen in the wiki tree
 OUT_DIR = ROOT / "runs" / "wiki"
-TREE_CHARS = "│├└─|`+-– \t"
-
-
-def _tree_paths(tree: str) -> list[str]:
-    """Best-effort parse of a wiki_tree string into full paths."""
-    paths: list[str] = []
-    stack: list[str] = []
-    entries = []
-    for line in tree.splitlines():
-        stripped = line.lstrip(TREE_CHARS)
-        name = stripped.strip()
-        if name and name not in {".", "./"}:  # skip blank lines and the root marker
-            entries.append((len(line) - len(stripped), name))
-    base = min((indent for indent, _ in entries), default=0)
-    for indent, name in entries:
-        if "/" in name.rstrip("/"):  # already a full path
-            paths.append(name.rstrip("/"))
-            continue
-        depth = (indent - base) // 4
-        stack = stack[:depth]
-        full = "/".join(stack + [name.rstrip("/")])
-        paths.append(full)
-        if name.endswith("/") or "." not in name:
-            stack.append(name.rstrip("/"))
-    return paths
 
 
 def _safe_out_path(wiki_path: str) -> Path:
