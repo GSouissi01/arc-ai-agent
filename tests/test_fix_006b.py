@@ -84,10 +84,10 @@ def create(**f):
 
 
 msg = agent._write_block_reason(create(**row, DEFERRED_GAS_VOL_SM3=0, DEFERRED_COND_VOL_STM3=0), mk_state(TASK010), DW(T))
-check("010 WELL-03 create with 0 -> VOLUME CHECK expects peer fraction 476000/7.16", msg and "DEFERRED_GAS_VOL_SM3=476000.0" in msg
-      and "DEFERRED_COND_VOL_STM3=7.16" in msg and "group_peer_fraction" in msg)
-check("010 WELL-03 create with peer values -> allowed", agent._write_block_reason(
-    create(**row, DEFERRED_GAS_VOL_SM3=476000.0, DEFERRED_COND_VOL_STM3=7.16), mk_state(TASK010), DW(T)) is None)
+check("010 WELL-03 create with 0 -> VOLUME CHECK expects span volume 1190000/17.9 (fix-010b)", msg and "DEFERRED_GAS_VOL_SM3=1190000.0" in msg
+      and "DEFERRED_COND_VOL_STM3=17.9" in msg and "group_span_hours" in msg)
+check("010 WELL-03 create with span values -> allowed", agent._write_block_reason(
+    create(**row, DEFERRED_GAS_VOL_SM3=1190000.0, DEFERRED_COND_VOL_STM3=17.9), mk_state(TASK010), DW(T)) is None)
 
 # forced event check key resolution
 check("task well + date -> one event key", agent._task_event_key(
@@ -139,7 +139,7 @@ agent.make_llm_client = lambda cfg: llm
 agent.run_agent(SimpleNamespace(get_wrfm_client=lambda t: w, log_llm=lambda **k: None),
                 SimpleNamespace(spec_id="zz_test_006", task_id="t", task_text=TASK010),
                 llm_config=agent.LLMConfig(provider="openai", model="m", api_key="k"))
-check("single-event select -> auto [event_check] appended", "[event_check]" in str(llm.inputs[1]) and "group_peer_fraction" in str(llm.inputs[1]))
+check("single-event select -> auto [event_check] appended", "[event_check]" in str(llm.inputs[1]) and "group_span_hours" in str(llm.inputs[1]))
 check("first ok_answer with unhandled missing -> EVENT CHECK block", "EVENT CHECK: unhandled items" in str(llm.inputs[2]) and "WELL-03" in str(llm.inputs[2]))
 responds = [f for f in w.dispatched if isinstance(f, Req_WrfmRespond)]
 check("second ok_answer with a stated reason -> allowed", len(responds) == 1)

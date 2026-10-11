@@ -80,9 +80,9 @@ est = agent._volume_estimate(no_clean, "X", "2025-10-14T00:00:00", None, "2025-1
 check("no clean day, CONSTRAINT -> clarification", est["method"] is None)
 grp = agent._local_event_check(w, agent.LocalEventCheck(type="local_event_check", event_key="G_NOVA7_2025-10-09-1"), st)
 ve3 = [e for e in grp["volume_estimate"] if e["well"] == "WELL-03"]
-check("fix-006: flat-ALLOC facility well -> missing via group_peer_fraction ~476000/7.16 (gas fraction for cond, 2 dp)",
-      [m["well"] for m in grp["missing_wells"]] == ["WELL-03"] and len(ve3) == 1 and ve3[0]["method"] == "group_peer_fraction"
-      and ve3[0]["write_gas"] == 476000.0 and ve3[0]["write_cond"] == 7.16 and ve3[0]["cond_decimals"] == 2 and "unaffected_wells" not in grp)
+check("fix-010b: flat-ALLOC facility well -> missing via group_span_hours 1190000/17.9",
+      [m["well"] for m in grp["missing_wells"]] == ["WELL-03"] and len(ve3) == 1 and ve3[0]["method"] == "group_span_hours"
+      and ve3[0]["write_gas"] == 1190000.0 and ve3[0]["write_cond"] == 17.9 and "unaffected_wells" not in grp)
 # 010-like: drop WELL-05's row from the CONSTRAINT group event -> WELL-05 is missing with its own clean-day estimate
 data3 = dict(DATA, deferments=[r for r in DATA["deferments"] if not (r["EVENT_KEY"] == "G_NOVA7_2025-10-09-1" and r["WELL_NAME"] == "WELL-05")])
 g3 = agent._local_event_check(DataWrfm(data3), agent.LocalEventCheck(type="local_event_check", event_key="G_NOVA7_2025-10-09-1"), st)

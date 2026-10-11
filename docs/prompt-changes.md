@@ -371,3 +371,13 @@ No prompt text changed.
 **Code:** the review-task owner-fill update (P-009c) now also accepts `is_empty` / `ne` predicates on DEFER_ACTIVITY_OWNER next to the eq key predicates (EVENT_KEY eq required; any other non-eq predicate, e.g. `in` / `contains`, or any other field change stays blocked). The matched-rows check is unchanged: every row the full where clause matches must be an empty-owner peer row of the event snapshot.
 
 **Evidence:** a review/correct run added `DEFER_ACTIVITY_OWNER is_empty` to correct per-row updates; all 5 attempts were blocked and the agent ended with a clarification ("expected outcome ok_answer got none_clarification_needed").
+
+## P-010b (2026-10-11, fix-010b): group-event flat-ALLOC well valued by event span (partial P-005 revert)
+
+No prompt text changed (rule 4 still mentions "the peers' loss fraction"; the agent writes volume_estimate's write values, which now come from the span method).
+
+**Scope (code):** a group-event (`G_`) well whose clean-day ALLOC difference shows no loss is now valued `group_span_hours` = `_volume(R, event span inside the production day)` (R = clean-day ALLOC), instead of `group_peer_fraction` (peers' median loss fraction x R). This applies to the missing-well estimate in local_event_check, the create volume check and the volume_mismatch check.
+
+**What P-005 still covers:** the gate. A flat-ALLOC group-event well is treated as affected only when `_peer_fraction` can be computed (>= 2 peer rows); otherwise it stays `unaffected_wells` and no update to 0 is proposed. Clean-day R, clean_day_diff for CONSTRAINT rows with an ALLOC loss, and every DOWN method are unchanged.
+
+**Evidence:** the review/correct run that got past the update count failed with "expected DEFERRED_GAS_VOL_SM3 1190000.0 got 476000.0" = 2,380,000 x 12 h (08:00-20:00) / 24. Replay of every peer-fraction value in the 42 fix-008b + fix-009 traces: only the failing review/correct task wrote one (476000.0/7.16 -> 1190000.0/17.9); the passing set-owner task only showed it in the info-only bootstrap event check and wrote nothing.

@@ -104,5 +104,26 @@ s3 = checked_state(T003)
 b3 = agent._write_block_reason(upd("Process Engineering", row + [("DEFER_ACTIVITY_OWNER", "is_empty", None)]), s3, DWop(T)) or ""
 check("010a 003 path untouched: OWNER BLOCKED not stated (clarify)", not s3.owner_fill and b3.startswith("OWNER BLOCKED") and agent._clarify_guard(b3) is not None)
 
+# ---- 010b: group-event flat-ALLOC missing well -> _volume(R, event span)
+s10b = mk_state(T010); s10b.today = "2025-10-15"
+c = agent._local_event_check(DWop(T), agent.LocalEventCheck(type="local_event_check", event_key=KEY), s10b)
+w3e = [e for e in c.get("volume_estimate", []) if e["well"] == "WELL-03"]
+print("  WELL-03 estimate", [{k: e.get(k) for k in ("method", "R_gas", "R_cond", "downtime_h", "write_gas", "write_cond")} for e in w3e])
+check("010b 010 WELL-03 -> group_span_hours 2380000 x 12h -> 1190000.0 / 17.9",
+      len(w3e) == 1 and w3e[0]["method"] == "group_span_hours" and w3e[0]["write_gas"] == 1190000.0 and w3e[0]["write_cond"] == 17.9)
+check("010b WELL-03 still listed as missing well", any(m["well"] == "WELL-03" for m in c.get("missing_wells", [])))
+peer = next(x for x in T["deferments"] if x["EVENT_KEY"] == KEY)
+def crt(gas, cond):
+    v = {k: peer[k] for k in ("EVENT_KEY", "DEFER_CATEGORY_IND", "START_DATE", "END_DATE", "EVENT_TYPE", "DEFER_GLOBAL_CAUSE",
+                              "DEFER_SYS_GRP", "ASSET_TYPE", "COMMENTS")}
+    v.update(WELL_NAME="WELL-03", PRODUCTION_DAY="2025-10-09", DEFER_ACTIVITY_OWNER="Process Engineering",
+             DEFERRED_GAS_VOL_SM3=str(gas), DEFERRED_COND_VOL_STM3=str(cond))
+    return Req_WrfmDataCreate(table_name="deferments", field_values=[WrfmKeyValue(field_name=k, value=x) for k, x in v.items()])
+rows = [x for x in T["deferments"] if x["EVENT_KEY"] == KEY]
+check("010b validator accepts 1190000.0 / 17.9", agent._volume_check(crt(1190000.0, 17.9), {fv.field_name: str(fv.value) for fv in crt(1190000.0, 17.9).field_values}, rows, DWop(T), s10b) is None)
+v_old = agent._volume_check(crt(476000.0, 7.16), {fv.field_name: str(fv.value) for fv in crt(476000.0, 7.16).field_values}, rows, DWop(T), s10b) or ""
+check("010b validator rejects old peer value 476000.0 -> expects 1190000.0", "DEFERRED_GAS_VOL_SM3=1190000.0" in v_old)
+check("010b peers' own rows: no volume_mismatch (clean_day_diff unchanged)", c.get("volume_mismatch") == [])
+
 print("FAILS:", fails)
 sys.exit(1 if fails else 0)

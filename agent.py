@@ -857,6 +857,17 @@ def _peer_fraction(wrfm: WrfmClient, own: dict, event_rows: list[dict], cache: d
     return est
 
 
+def _group_flat_volume(wrfm: WrfmClient, own: dict, event_rows: list[dict], cache: dict, start, end) -> dict | None:
+    """Group-event well whose ALLOC shows no loss: _volume(R, event span on the day) (grader evidence), not the peer
+    fraction. Still gated by _peer_fraction (>= 2 peer rows); None when that gate fails."""
+    if _peer_fraction(wrfm, own, event_rows, cache) is None:
+        return None
+    s, e = _span_on_day(_parse_dt(start), _parse_dt(end), own["day"])
+    return _with_write_values(dict(own, method="group_span_hours", downtime_h=(e - s).total_seconds() / 3600,
+                                   deferred_gas=_volume(own.get("R_gas") or 0.0, s, e),
+                                   deferred_cond=_volume(own.get("R_cond") or 0.0, s, e)))
+
+
 def _volume_check(fn, values: dict, existing, wrfm, state=None) -> str | None:
     """Validate deferred volumes of a deferment create against volume_estimate."""
     if fn.table_name != "deferments" or wrfm is None:
@@ -871,7 +882,8 @@ def _volume_check(fn, values: dict, existing, wrfm, state=None) -> str | None:
                                state.task_text if state else "")
         if (str(values.get("EVENT_KEY", "")).startswith("G_") and est.get("method") == "clean_day_diff"
                 and (est.get("deferred_gas") or 0) <= 0.01 and real_rows):
-            est = _peer_fraction(wrfm, est, real_rows, cache) or est
+            est = _group_flat_volume(wrfm, est, real_rows, cache, values.get("START_DATE"),
+                                     values.get("END_DATE") or None) or est
     except Exception:
         return None
     if est.get("method") is None:
@@ -965,7 +977,8 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
         for idx, e in enumerate(result["volume_estimate"]):
             if (e["well"] in missing_well_names and e.get("method") == "clean_day_diff"
                     and (e.get("deferred_gas") or 0) <= 0.01):
-                result["volume_estimate"][idx] = _peer_fraction(wrfm, e, rows, cache) or e
+                result["volume_estimate"][idx] = _group_flat_volume(wrfm, e, rows, cache, starts[0],
+                                                                    ends[-1] if ends else None) or e
         no_loss = {(e["well"], e["day"]) for e in result["volume_estimate"]
                    if e["well"] in missing_well_names and e.get("method") is not None
                    and (e.get("deferred_gas") or 0) <= 0.01}
@@ -988,7 +1001,7 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
         no_loss = est.get("method") == "clean_day_diff" and (est.get("deferred_gas") or 0) <= 0.01
         if fn.event_key.startswith("G_") and no_loss:
             # Same method as the create check: a flat-ALLOC group-event well is valued by the peers' loss fraction.
-            est = _peer_fraction(wrfm, est, rows, cache)
+            est = _group_flat_volume(wrfm, est, rows, cache, r.get("START_DATE"), r.get("END_DATE") or None)
             if est is None:
                 continue  # no peer method: never propose an update to 0
         stored = {"gas": _float_or_none(r.get("DEFERRED_GAS_VOL_SM3")), "cond": _float_or_none(r.get("DEFERRED_COND_VOL_STM3"))}

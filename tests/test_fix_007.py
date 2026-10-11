@@ -126,11 +126,11 @@ def with_w3(gas, cond):
     rows = [dict(r) for r in T["deferments"]] + [dict(peer, WELL_NAME="WELL-03", DEFERRED_GAS_VOL_SM3=gas, DEFERRED_COND_VOL_STM3=cond)]
     return DW(dict(T, deferments=rows))
 ev = agent.LocalEventCheck(type="local_event_check", event_key="G_NOVA7_2025-10-09-1")
-r = agent._local_event_check(with_w3(476000.0, 7.16), ev, agent._TaskState(task_text=T010, today="2025-10-15"))
+r = agent._local_event_check(with_w3(1190000.0, 17.9), ev, agent._TaskState(task_text=T010, today="2025-10-15"))
 check("after WELL-03 create: no volume_mismatch", r["volume_mismatch"] == [] and r["missing"] == [])
 r = agent._local_event_check(with_w3(0.0, 0.0), ev, agent._TaskState(task_text=T010, today="2025-10-15"))
-check("WELL-03 stored 0 -> mismatch expects peer value 476000/7.16",
-      [(m["well"], m["expected_gas"], m["expected_cond"], m["method"]) for m in r["volume_mismatch"]] == [("WELL-03", 476000.0, 7.16, "group_peer_fraction")])
+check("WELL-03 stored 0 -> mismatch expects span value 1190000/17.9 (fix-010b)",
+      [(m["well"], m["expected_gas"], m["expected_cond"], m["method"]) for m in r["volume_mismatch"]] == [("WELL-03", 1190000.0, 17.9, "group_span_hours")])
 
 
 class LLM:
