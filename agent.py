@@ -434,13 +434,17 @@ def _owner_fill(wrfm: WrfmClient, key: str, rows: list[dict]) -> dict | None:
 
 
 def _owner_fill_ok(fn, values: dict, state, wrfm: WrfmClient | None) -> bool:
-    """An owner-only update on a review task to empty-owner peer rows of the checked event, with the precedent value."""
+    """An owner-only update on a review task to empty-owner peer rows of the checked event, with the precedent value.
+    Where clause: eq key predicates (EVENT_KEY required), plus optional is_empty / ne predicates on the owner only."""
     if (not isinstance(fn, Req_WrfmDataUpdate) or fn.table_name != "deferments" or wrfm is None
             or set(values) != {"DEFER_ACTIVITY_OWNER"} or not _review_task(state.task_text)):
         return False
     where = {c.field_name: str(c.value) for c in fn.where_clause if c.operator == "eq"}
     fill = state.owner_fill.get(where.get("EVENT_KEY", ""))
-    if not fill or len(where) != len(fn.where_clause) or values["DEFER_ACTIVITY_OWNER"] != fill["value"]:
+    # Key predicates must be eq; only DEFER_ACTIVITY_OWNER may add narrowing predicates (is_empty, ne).
+    shape_ok = all(c.operator == "eq" if c.field_name != "DEFER_ACTIVITY_OWNER" else c.operator in ("is_empty", "ne")
+                   for c in fn.where_clause)
+    if not fill or not shape_ok or values["DEFER_ACTIVITY_OWNER"] != fill["value"]:
         return False
     peers = {(r["well"], r["day"]) for r in fill["rows"]}
     matched = _select_all(wrfm, "deferments", list(fn.where_clause))

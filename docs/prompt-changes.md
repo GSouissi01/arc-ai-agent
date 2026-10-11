@@ -363,3 +363,11 @@ No prompt text changed.
 **Code:** a create on a new `W_` event must use the strict-majority ASSET_TYPE of that well's own `W_` event rows (blocked otherwise with the expected value). A tie or no rows falls back to the previous behaviour and logs `ASSET_TYPE NO PRECEDENT` in the trace. Group (`G_`) rows and DEFER_SYS_GRP are not used. No well has a unique ASSET_TYPE in the snapshot (WELL-05 `W_` rows: Well 3, Facility 1), so the rule is a majority, not a unique match (user decision).
 
 **Evidence:** a new WELL-05 event create scored "expected ASSET_TYPE Well got Equipment"; no stored row uses Equipment.
+
+## P-010a (2026-10-11, fix-010a): owner-fill guard accepts owner narrowing predicates
+
+No prompt text changed.
+
+**Code:** the review-task owner-fill update (P-009c) now also accepts `is_empty` / `ne` predicates on DEFER_ACTIVITY_OWNER next to the eq key predicates (EVENT_KEY eq required; any other non-eq predicate, e.g. `in` / `contains`, or any other field change stays blocked). The matched-rows check is unchanged: every row the full where clause matches must be an empty-owner peer row of the event snapshot.
+
+**Evidence:** a review/correct run added `DEFER_ACTIVITY_OWNER is_empty` to correct per-row updates; all 5 attempts were blocked and the agent ended with a clarification ("expected outcome ok_answer got none_clarification_needed").
