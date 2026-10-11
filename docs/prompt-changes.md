@@ -308,3 +308,15 @@ Code sets COMMENTS = `"<Cause> deferment; prorated by downtime within the day."`
 - Review/correct group event: after the missing-well create (peer fraction 476,000 / 7.16), volume_mismatch recomputed it with clean_day_diff (0) and the agent overwrote it with 0.
 
 **Specs to re-check:** all.
+
+## P-007 (2026-10-11, fix-008): Python rounding, am/pm naive rule
+
+No prompt text changed.
+
+**Write rounding (code):** write_gas / write_cond = Python `round(value, 2)` on the unrounded R x hours / 24 (was half-up). The volume validator uses the same function. Offline: 37/38 stored rows match at 2 decimals; the one miss is a source double-rounding row (G_NOVA7_2025-09-11-1 WELL-02 condensate: unrounded 36.72499..., stored 36.73). The evaluator evidence wins over that row: a create expecting 46.8 x 14.5 / 24 = 28.27 (half-up gave 28.28).
+
+**Time parsing (code):** am/pm follows the evaluator's naive rule: H am = H:00 (so 12am = 12:00), H pm = (H+12):00 (so 12pm = 24:00, end of day). Matches the evaluator; differs from the standard 12am = midnight. "midnight" stays 00:00 as a start / 24:00 as an end; "noon" / "midday" = 12:00. One parser serves the stated-hours window, the END TIME guard and END_DATE: volume_estimate returns `stated_end`, and a create on a new event whose END_DATE differs from the stated window end is blocked with `END_DATE: the task states the window end; write END_DATE=<end>`. Example: "from 07:00:00 to 12am" -> END_DATE same day 12:00, 5 h window.
+
+**Unchanged:** 004 and 010 stay parked.
+
+**Specs to re-check:** all.

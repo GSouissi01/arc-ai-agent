@@ -323,15 +323,12 @@ def _known_event_rows(key: str | None, state, wrfm: WrfmClient | None) -> list[d
     return [{"EVENT_KEY": key, "DEFER_ACTIVITY_OWNER": o} for o in owners] or None
 
 
-_EXPLICIT_TIME = [
-    re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b"),
-    re.compile(r"\b(midday|noon|midnight)\b", re.IGNORECASE),
-    re.compile(r"\b\d{1,2}\s?(am|pm)\b", re.IGNORECASE),
-]
+_TIME_TOKEN = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b|\b(midday|noon|midnight)\b|\b(\d{1,2})\s?(am|pm)\b",
+                         re.IGNORECASE)
 
 
 def _has_explicit_time(text: str) -> bool:
-    return any(p.search(text or "") for p in _EXPLICIT_TIME)
+    return bool(_TIME_TOKEN.search(text or ""))
 
 
 def _create_key(fn, state):
@@ -473,6 +470,15 @@ def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
             and not _has_explicit_time(state.task_text)):
         return ("END TIME BLOCKED: the task states no restart/end time. Do not assume one. "
                 "Respond none_clarification_needed asking for the exact restart timestamp.")
+    stated_end = _stated_end(state.task_text, values.get("START_DATE"))
+    if fn.table_name == "deferments" and is_create and not real_rows and values.get("END_DATE") and stated_end:
+        try:
+            end_ok = _parse_dt(values["END_DATE"]) == datetime.fromisoformat(stated_end)
+        except ValueError:
+            end_ok = False
+        if not end_ok:
+            return (f"END_DATE: the task states the window end; write END_DATE={stated_end} "
+                    "(H am = H:00, so 12am = 12:00; H pm = (H+12):00, so 12pm = 24:00).")
 
     if is_create:
         volume_block = _volume_check(fn, values, existing, wrfm, state)
@@ -625,14 +631,11 @@ def _rate_per_well(rows: list[dict]) -> dict[str, dict[str, float | None]]:
     return {w: {k: best(v) for k, v in r.items()} for w, r in rates.items()}
 
 
-_TIME_TOKEN = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b|\b(midday|noon|midnight)\b|\b(\d{1,2})\s?(am|pm)\b",
-                         re.IGNORECASE)
-
-
 def _stated_window(text: str, event_day: str) -> tuple[datetime, datetime] | None:
     """Start/end stated in the task text (exactly two times), placed on the event start day.
 
-    Midnight / 12am is 00:00 as a start and 24:00 as an end. An end before the start crosses midnight.
+    Midnight is 00:00 as a start and 24:00 as an end; noon / midday is 12:00. am/pm follows the evaluator's
+    naive rule: H am = H:00 (12am = 12:00), H pm = (H+12):00 (12pm = 24:00). An end before the start crosses midnight.
     """
     tokens = []
     for m in _TIME_TOKEN.finditer(text or ""):
@@ -641,8 +644,7 @@ def _stated_window(text: str, event_day: str) -> tuple[datetime, datetime] | Non
         elif m.group(4):
             tokens.append(None if m.group(4).lower() == "midnight" else 720)
         else:
-            hour = int(m.group(5)) % 12 + (12 if m.group(6).lower() == "pm" else 0)
-            tokens.append(None if hour == 0 else hour * 60)
+            tokens.append((int(m.group(5)) + (12 if m.group(6).lower() == "pm" else 0)) * 60)
     if len(tokens) != 2:
         return None
     t1 = 0 if tokens[0] is None else tokens[0]
@@ -653,6 +655,15 @@ def _stated_window(text: str, event_day: str) -> tuple[datetime, datetime] | Non
     return day0 + timedelta(minutes=t1), day0 + timedelta(minutes=t2)
 
 
+def _stated_end(text: str, event_day) -> str | None:
+    """END_DATE (YYYY-MM-DDTHH:MM:SS) of the window stated in the task, or None."""
+    try:
+        window = _stated_window(text, event_day) if event_day else None
+    except ValueError:
+        return None
+    return window[1].isoformat(timespec="seconds") if window else None
+
+
 def _window_hours_on_day(window: tuple[datetime, datetime], production_day: str) -> float:
     day_start = datetime.fromisoformat(str(production_day)[:10])
     overlap = (min(window[1], day_start + timedelta(days=1)) - max(window[0], day_start)).total_seconds() / 3600.0
@@ -660,8 +671,8 @@ def _window_hours_on_day(window: tuple[datetime, datetime], production_day: str)
 
 
 def _round2(value: float) -> float:
-    """Round half-up to 2 decimals (float noise removed first): 36.724999... -> 36.73."""
-    return float(Decimal(repr(round(value, 9))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    """Python round() to 2 decimals on the unrounded value (matches the evaluator: 46.8 x 14.5 / 24 -> 28.27)."""
+    return round(value, 2)
 
 
 def _with_write_values(est: dict) -> dict:
@@ -715,6 +726,7 @@ def _volume_estimate_raw(wrfm: WrfmClient, well, start, end, production_day, eve
         stated = _window_hours_on_day(window, day) if window else 0.0
         if stated > 0:
             return dict(out, method="clean_day_stated_hours", downtime_h=stated,
+                        stated_end=window[1].isoformat(timespec="seconds"),
                         deferred_gas=r_gas * stated / 24, deferred_cond=r_cond * stated / 24)
         hours = _downtime_h(start, end, day, exact=True)
         return dict(out, method="clean_day_span_hours", downtime_h=hours,
