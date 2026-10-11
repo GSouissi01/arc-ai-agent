@@ -47,3 +47,66 @@ Volume rule: rule B. `tools/check_volume_rule.py` matched rule A (rate = last da
 - Baseline `wrfm_def_002`, `wrfm_def_003`, `wrfm_def_009`, `wrfm_def_010`: failed in the baseline run (triaged outside this repo).
 
 **Specs to re-check:** all (`wrfm_def_001` to `wrfm_def_010`).
+
+## P-002 (2026-10-11, fix-003)
+
+**Replaced: closing bullet (rule 4)**
+
+Old:
+
+```
+   - Closing an event: set the same END_DATE on every row of the event, and make sure a row exists for every production day from the start day to the end day; create the missing ones.
+```
+
+New:
+
+```
+   - Closing an event: run local_event_check first. Create every missing production-day row WITH END_DATE already set to the closing timestamp; the closing-day row is prorated from 00:00 to END_DATE. Then update END_DATE on all existing rows of the event. Then run local_event_check again and confirm missing is empty and every row has the same END_DATE.
+```
+
+**Replaced: volume bullet (rule 4, was rule B from P-001)**
+
+Old:
+
+```
+   - Deferred volumes = daily rate × (downtime hours inside that production day ÷ 24). Get the daily rate from an existing full-day row of the same event if one exists, otherwise from the well's daily_production before the event. Compute with local_calc. Never write 0 or a placeholder volume.
+```
+
+New:
+
+```
+   - Deferred volumes: deferred volume for a row = R × downtime_h / 24, where R is the well's full-day rate. Get downtime_h and uptime_h from local_downtime, and do the arithmetic with local_calc. Choose R in this order:
+     a. Existing event (its rows already exist): always use rate_per_well for that well from local_event_check.
+     b. New event with no rows yet that is a full stop (EVENT_TYPE DOWN, or type not stated): daily_production ALLOC values are ACTUAL production, already reduced by downtime, so R = ALLOC on a production day with uptime (e.g. the event start day) × 24 / uptime_h for that day.
+     c. New event that is a partial curtailment (EVENT_TYPE CONSTRAINT: a rate cut, restriction or limit): the lost rate cannot be derived from the data; respond none_clarification_needed for the volumes instead of guessing.
+     Never use a day's ALLOC directly as the rate, and never write 0 or a placeholder volume.
+```
+
+**Added to rule 3**
+
+```
+   For review/correct tasks on an event, run local_event_check: create rows for every missing (well, day) pair and fix rows that break a guide rule. Do not change fields the guide does not require.
+```
+
+**Added rule 9**
+
+```
+9. Answer format: if the task asks for "only" a value (a figure, a number, a name), the message must be exactly that value and nothing else: no words, no units, no thousands separators, at most 2 decimals, as computed. Otherwise keep messages concise.
+```
+
+**Evidence for the volume rule** (offline, `runs/data/*.json`, wrfm_def_001 snapshot, 37 rows with downtime > 0):
+
+- R_row = deferred × 24 / downtime_h is constant within 1% per event and well: 30/30 (100%; only 2 groups have more than one row with downtime).
+- R_alloc = ALLOC(day) × 24 / uptime_h matches R_row within 1% on 20/30 rows (66.7%). All 20 matches are EVENT_TYPE DOWN; all 10 mismatches are EVENT_TYPE CONSTRAINT (comments: rate cut, restriction, choke limit), where the deferred volume is a partial loss.
+
+**Reason**
+
+- fix-002 `wrfm_def_006`: used the event day's ALLOC as the rate (553,125 instead of 737,500).
+- fix-002 `wrfm_def_001`: used the start day's reduced ALLOC as the rate (2,222,986.11 instead of 2,380,000).
+- fix-002 `wrfm_def_002`: used the start day's ALLOC as the rate; the closing-day row was created without END_DATE.
+- fix-002 `wrfm_def_004`: the right figure, but the message was a sentence instead of only the number.
+- fix-002 `wrfm_def_010`: the review missed a required create (missing production-day row).
+- fix-002 `wrfm_def_003`, `wrfm_def_010`: DEFER_ACTIVITY_OWNER inferred from the cause (now also blocked in code).
+- fix-002 `wrfm_def_005`: Operations Supervisor closed an event (now blocked in code by the RACI authority guard).
+
+**Specs to re-check:** all (`wrfm_def_001` to `wrfm_def_010`).
