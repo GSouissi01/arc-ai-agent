@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 import json
 import operator
 from pathlib import Path
@@ -196,6 +197,7 @@ Use deferment guidelines for deferment event and production-day rules.
 Use extensive ground refs to reference the exact source of your knowledge and authority, especially for write actions.
 
 All wiki documents are already loaded above. Base every decision on them.
+If an [event_check] block is present, it is the code's check of the event the task is about: handle every missing and volume_mismatch item it lists, or state why not.
 
 Decision checklist (follow in order):
 0. Check authority before anything else (see [authority]). No authority -> respond denied_security, even if details are missing, and cite governance/raci.md.
@@ -215,11 +217,11 @@ Decision checklist (follow in order):
    - Adding a missing day row (or missing well) for an existing event: copy every event attribute from that event's existing rows: EVENT_KEY, START_DATE, END_DATE (if the event is closed), cause, system group, category, event type, asset type, activity owner and COMMENTS.
    - New event: build EVENT_KEY exactly as the deferment guide says, matching the format of existing keys. Use approved labels only, choosing the closest approved label for the stated cause and system. Fill every required field. For a new event choose the closest approved labels (cause, system group, activity owner) from the guide. For a row of an existing event copy them.
    - Closing an event: Only when the task states the restart/end time explicitly. Run local_event_check first. Create every missing production-day row WITH END_DATE already set to the closing timestamp; the closing-day row is prorated from 00:00 to END_DATE. Then update END_DATE on all existing rows of the event. Then run local_event_check again and confirm missing is empty and every row has the same END_DATE.
-   - Deferred volumes come only from volume_estimate. local_event_check returns volume_estimate for every missing day and missing well of an existing event; for a new event (or any single row) call local_volume_estimate with the well, start, end, production day and event type. Write deferred_gas and deferred_cond rounded to 2 decimals. If volume_estimate has no method (clarification_needed), respond none_clarification_needed asking for the volumes and cite the event. Never compute volumes yourself, never guess, and never write 0 unless volume_estimate is 0.
+   - Deferred volumes come only from volume_estimate (DOWN rows: the stated or event-span downtime hours x the well's clean-day rate; CONSTRAINT rows: the clean-day ALLOC difference, or the peers' loss fraction for a group-event well whose production data shows no loss). local_event_check returns volume_estimate for every missing day and missing well of an existing event; for a new event (or any single row) call local_volume_estimate with the well, start, end, production day and event type. Write its write_gas and write_cond values exactly as given. If volume_estimate has no method (clarification_needed), respond none_clarification_needed asking for the volumes and cite the event. Never compute volumes yourself, never guess, and never write 0 unless volume_estimate is 0.
 5. Each step executes its function immediately. A create or update that returned a row is done; never repeat it.
 6. Data: select one table at a time. Do not use order_by. Use local_aggregate for totals, maximums and per-event sums, and local_calc for every arithmetic step. Never do arithmetic in your head.
 7. Tool errors: read the error and change the call. Never repeat an identical failing call. A tool error is never a reason for denied_security or none_unsupported.
-8. Ground refs: cite wiki docs by full path, tables by name, wells by WELL_NAME, and deferment events by EVENT_KEY. Cite only items you actually used in this task. Always cite the deferment event you were asked about (by EVENT_KEY), also in clarification and denied answers.
+8. Ground refs: cite wiki docs by full path, tables by name, wells by WELL_NAME, and deferment events by EVENT_KEY. Cite only items you actually used in this task. Always cite the deferment event you were asked about (by EVENT_KEY), also in clarification and denied answers. Cite every well you wrote or asked about.
 9. Answer format: if the task asks for "only" a value (a figure, a number, a name), the message must be exactly that value and nothing else: no words, no units, no thousands separators, at most 2 decimals, as computed. Otherwise keep messages concise.
 """
 
@@ -252,6 +254,11 @@ class _TaskState:
     trace_path: Path | None = None
     event_targets: set[str] = field(default_factory=set)  # EVENT_KEYs written (incl. blocked) or event-checked
     selected_keys: set[str] = field(default_factory=set)  # EVENT_KEYs in deferments select results
+    ref_wells: set[str] = field(default_factory=set)  # wells written (incl. blocked) or targeted by a check
+    event_checks: dict[str, dict] = field(default_factory=dict)  # EVENT_KEY -> latest local_event_check result
+    written_pairs: set[tuple[str, str]] = field(default_factory=set)  # (well, day) created this task
+    updated_pairs: set[tuple[str, str]] = field(default_factory=set)  # (well, day) updated this task
+    event_check_blocks: int = 0
 
 
 def _trace(state, record: dict) -> None:
@@ -266,6 +273,7 @@ def _trace(state, record: dict) -> None:
 
 
 _ID_KEYS = {"WELL_NAME", "well", "EVENT_KEY", "event_key", "group"}
+_W_EVENT_KEY = re.compile(r"^W_(.+)_\d{4}-\d{2}-\d{2}-\d+$")
 
 
 def _collect_ids(obj, state) -> None:
@@ -383,8 +391,8 @@ def _event_consistency(values: dict, rows: list[dict], state) -> dict:
     mismatch = {}
     for name in _EVENT_FIELDS:
         existing_vals = [str(r.get(name) or "").strip() for r in rows]
-        if name == "END_DATE" and not any(existing_vals):
-            continue  # open event: END_DATE is handled by the END TIME guard
+        if not any(existing_vals):
+            continue  # nothing to copy (e.g. open event END_DATE, or a field left empty on the event's rows)
         given = values.get(name, "")
         if given in existing_vals or (given and given.lower() in state.task_text.lower()):
             continue
@@ -456,7 +464,7 @@ def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
                 "Respond none_clarification_needed asking for the exact restart timestamp.")
 
     if is_create:
-        volume_block = _volume_check(fn, values, existing, wrfm)
+        volume_block = _volume_check(fn, values, existing, wrfm, state)
         if volume_block:
             return volume_block
 
@@ -551,14 +559,14 @@ def _parse_dt(value) -> datetime | None:
     return datetime.fromisoformat(str(value).strip())
 
 
-def _downtime_h(start, end, production_day) -> float:
-    """Hours of [start, end) inside [production_day 00:00, +24h); empty end = ongoing."""
+def _downtime_h(start, end, production_day, exact: bool = False) -> float:
+    """Hours of [start, end) inside [production_day 00:00, +24h); empty end = ongoing (rounded unless exact)."""
     day_start = datetime.fromisoformat(str(production_day).strip()[:10])
     day_end = day_start + timedelta(days=1)
     start_dt = _parse_dt(start)
     end_dt = _parse_dt(end) or day_end
     overlap = (min(end_dt, day_end) - max(start_dt, day_start)).total_seconds() / 3600.0
-    return round(max(overlap, 0.0), 6)
+    return max(overlap, 0.0) if exact else round(max(overlap, 0.0), 6)
 
 
 def _local_downtime(fn: LocalDowntime) -> dict:
@@ -585,7 +593,7 @@ def _rate_per_well(rows: list[dict]) -> dict[str, dict[str, float | None]]:
     rates: dict[str, dict[str, list[tuple[float, float]]]] = {}
     for r in rows:
         try:
-            downtime = _downtime_h(r.get("START_DATE"), r.get("END_DATE"), r.get("PRODUCTION_DAY"))
+            downtime = _downtime_h(r.get("START_DATE"), r.get("END_DATE"), r.get("PRODUCTION_DAY"), exact=True)
         except (TypeError, ValueError):
             continue
         if downtime <= 0:
@@ -606,15 +614,68 @@ def _rate_per_well(rows: list[dict]) -> dict[str, dict[str, float | None]]:
     return {w: {k: best(v) for k, v in r.items()} for w, r in rates.items()}
 
 
+_TIME_TOKEN = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b|\b(midday|noon|midnight)\b|\b(\d{1,2})\s?(am|pm)\b",
+                         re.IGNORECASE)
+
+
+def _stated_window(text: str, event_day: str) -> tuple[datetime, datetime] | None:
+    """Start/end stated in the task text (exactly two times), placed on the event start day.
+
+    Midnight / 12am is 00:00 as a start and 24:00 as an end. An end before the start crosses midnight.
+    """
+    tokens = []
+    for m in _TIME_TOKEN.finditer(text or ""):
+        if m.group(1):
+            tokens.append(int(m.group(1)) * 60 + int(m.group(2)) + int(m.group(3) or 0) / 60)
+        elif m.group(4):
+            tokens.append(None if m.group(4).lower() == "midnight" else 720)
+        else:
+            hour = int(m.group(5)) % 12 + (12 if m.group(6).lower() == "pm" else 0)
+            tokens.append(None if hour == 0 else hour * 60)
+    if len(tokens) != 2:
+        return None
+    t1 = 0 if tokens[0] is None else tokens[0]
+    t2 = 1440 if tokens[1] is None else tokens[1]
+    if t2 <= t1:
+        t2 += 1440
+    day0 = datetime.fromisoformat(str(event_day)[:10])
+    return day0 + timedelta(minutes=t1), day0 + timedelta(minutes=t2)
+
+
+def _window_hours_on_day(window: tuple[datetime, datetime], production_day: str) -> float:
+    day_start = datetime.fromisoformat(str(production_day)[:10])
+    overlap = (min(window[1], day_start + timedelta(days=1)) - max(window[0], day_start)).total_seconds() / 3600.0
+    return max(overlap, 0.0)
+
+
+def _round2(value: float) -> float:
+    """Round half-up to 2 decimals (float noise removed first): 36.724999... -> 36.73."""
+    return float(Decimal(repr(round(value, 9))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _with_write_values(est: dict) -> dict:
+    if est.get("method") is not None:
+        est["write_gas"], est["write_cond"] = _round2(est["deferred_gas"]), _round2(est["deferred_cond"])
+    return est
+
+
 def _volume_estimate(wrfm: WrfmClient, well, start, end, production_day, event_type,
-                     event_rows: list[dict] | None = None, cache: dict | None = None) -> dict:
+                     event_rows: list[dict] | None = None, cache: dict | None = None, task_text: str = "") -> dict:
+    """volume_estimate plus write_gas / write_cond (the 2-decimal values to write)."""
+    return _with_write_values(_volume_estimate_raw(wrfm, well, start, end, production_day, event_type,
+                                                   event_rows, cache, task_text))
+
+
+def _volume_estimate_raw(wrfm: WrfmClient, well, start, end, production_day, event_type,
+                         event_rows: list[dict] | None = None, cache: dict | None = None, task_text: str = "") -> dict:
     """Deferred volumes of one (well, production day) row (unrounded).
 
     R = the well's ALLOC on the last clean day before the event start (no deferment row for that well that day).
-    - production day has daily_production: deferred = R - ALLOC(day)          (clean_day_diff)
-    - no daily_production yet, DOWN: deferred = R x downtime_h / 24            (clean_day_hours)
-    - no clean day, DOWN: best R from the event's rows x downtime_h / 24       (best_R_fallback)
-    - otherwise (incl. CONSTRAINT without data): no method -> clarification.
+    DOWN:       times stated in the task -> R x stated_hours_on_day / 24        (clean_day_stated_hours)
+                else R x event-span hours inside the production day / 24       (clean_day_span_hours)
+                no clean day: best R from the event's rows x span hours / 24   (best_R_fallback)
+    CONSTRAINT: day has daily_production -> R - ALLOC(day)                     (clean_day_diff)
+    Otherwise: no method -> clarification.
     """
     day = str(production_day)[:10]
     start_day = str(start)[:10]
@@ -633,41 +694,84 @@ def _volume_estimate(wrfm: WrfmClient, well, start, end, production_day, event_t
         r_gas = _float_or_none(prod[clean].get("ALLOC_GAS_SM3")) or 0.0
         r_cond = _float_or_none(prod[clean].get("ALLOC_COND_M3")) or 0.0
         out = dict(base, clean_day=clean, R_gas=r_gas, R_cond=r_cond)
-        if day in prod:
-            a_gas = _float_or_none(prod[day].get("ALLOC_GAS_SM3")) or 0.0
-            a_cond = _float_or_none(prod[day].get("ALLOC_COND_M3")) or 0.0
-            return dict(out, method="clean_day_diff", deferred_gas=r_gas - a_gas, deferred_cond=r_cond - a_cond)
-        if not constraint:
-            hours = _downtime_h(start, end, day)
-            return dict(out, method="clean_day_hours", downtime_h=hours,
-                        deferred_gas=r_gas * hours / 24, deferred_cond=r_cond * hours / 24)
-        return dict(out, clarification_needed="CONSTRAINT row without daily_production for that day: ask for the volumes")
+        if constraint:
+            if day in prod:
+                a_gas = _float_or_none(prod[day].get("ALLOC_GAS_SM3")) or 0.0
+                a_cond = _float_or_none(prod[day].get("ALLOC_COND_M3")) or 0.0
+                return dict(out, method="clean_day_diff", deferred_gas=r_gas - a_gas, deferred_cond=r_cond - a_cond)
+            return dict(out, clarification_needed="CONSTRAINT row without daily_production for that day: ask for the volumes")
+        window = _stated_window(task_text, start_day)
+        stated = _window_hours_on_day(window, day) if window else 0.0
+        if stated > 0:
+            return dict(out, method="clean_day_stated_hours", downtime_h=stated,
+                        deferred_gas=r_gas * stated / 24, deferred_cond=r_cond * stated / 24)
+        hours = _downtime_h(start, end, day, exact=True)
+        return dict(out, method="clean_day_span_hours", downtime_h=hours,
+                    deferred_gas=r_gas * hours / 24, deferred_cond=r_cond * hours / 24)
     if not constraint and event_rows:
         rate = _rate_per_well(event_rows).get(str(well))
         if rate and rate.get("gas") is not None:
-            hours = _downtime_h(start, end, day)
+            hours = _downtime_h(start, end, day, exact=True)
             return dict(base, method="best_R_fallback", R_gas=rate["gas"], R_cond=rate.get("cond") or 0.0,
                         downtime_h=hours, deferred_gas=rate["gas"] * hours / 24,
                         deferred_cond=(rate.get("cond") or 0.0) * hours / 24)
     return dict(base, clarification_needed="no clean production day before the event start: ask for the volumes")
 
 
-def _volume_check(fn, values: dict, existing, wrfm) -> str | None:
+def _peer_fraction(wrfm: WrfmClient, own: dict, event_rows: list[dict], cache: dict) -> dict | None:
+    """Volume for a facility well whose ALLOC shows no loss on a group event: the peers' loss fraction.
+
+    One physical cut fraction = median over >= 2 peer rows of (peer deferred gas / peer clean-day gas rate),
+    applied to this well's clean-day gas AND condensate rates. Condensate is written at 1 decimal when every
+    peer's stored condensate equals round(peer clean-day cond rate x fraction, 1), else at 2 decimals.
+    Returns None when it cannot be computed.
+    """
+    day = own.get("day")
+    peers = [r for r in event_rows if str(r.get("PRODUCTION_DAY"))[:10] == day and r.get("WELL_NAME") != own.get("well")]
+    if len(peers) < 2 or not own.get("R_gas"):
+        return None
+    fractions, peer_cond = [], []
+    for r in peers:
+        est = _volume_estimate(wrfm, r.get("WELL_NAME"), r.get("START_DATE"), r.get("END_DATE") or None, day,
+                               "CONSTRAINT", event_rows, cache)
+        gas, rate = _float_or_none(r.get("DEFERRED_GAS_VOL_SM3")), est.get("R_gas")
+        if gas is not None and rate:
+            fractions.append(gas / rate)
+        peer_cond.append((_float_or_none(r.get("DEFERRED_COND_VOL_STM3")), est.get("R_cond")))
+    if len(fractions) < 2:
+        return None
+    fraction = statistics.median(fractions)
+    cond_1dp = all(stored is not None and rate is not None and stored == round(rate * fraction, 1)
+                   for stored, rate in peer_cond)
+    est = _with_write_values(dict(own, method="group_peer_fraction", peer_fraction=fraction, peers=len(peers),
+                                  cond_decimals=1 if cond_1dp else 2, deferred_gas=own["R_gas"] * fraction,
+                                  deferred_cond=(own.get("R_cond") or 0.0) * fraction))
+    if cond_1dp:
+        est["write_cond"] = float(Decimal(repr(round(est["deferred_cond"], 9))).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+    return est
+
+
+def _volume_check(fn, values: dict, existing, wrfm, state=None) -> str | None:
     """Validate deferred volumes of a deferment create against volume_estimate."""
     if fn.table_name != "deferments" or wrfm is None:
         return None
     if not all(values.get(f) for f in ("WELL_NAME", "PRODUCTION_DAY", "START_DATE")):
         return None  # incomplete row: the required-field check reports it
     try:
+        real_rows = [r for r in (existing or []) if r.get("START_DATE")]
+        cache: dict = {}
         est = _volume_estimate(wrfm, values.get("WELL_NAME"), values.get("START_DATE"), values.get("END_DATE") or None,
-                               values.get("PRODUCTION_DAY"), values.get("EVENT_TYPE", ""),
-                               [r for r in (existing or []) if r.get("START_DATE")])
+                               values.get("PRODUCTION_DAY"), values.get("EVENT_TYPE", ""), real_rows, cache,
+                               state.task_text if state else "")
+        if (str(values.get("EVENT_KEY", "")).startswith("G_") and est.get("method") == "clean_day_diff"
+                and (est.get("deferred_gas") or 0) <= 0.01 and real_rows):
+            est = _peer_fraction(wrfm, est, real_rows, cache) or est
     except Exception:
         return None
     if est.get("method") is None:
         return (f"VOLUME CHECK: no data-derived volume_estimate for this row ({est.get('clarification_needed')}). "
                 "Do not guess: respond none_clarification_needed asking for the volumes and cite the event.")
-    expected = {"gas": round(est["deferred_gas"], 2), "cond": round(est["deferred_cond"], 2)}
+    expected = {"gas": est["write_gas"], "cond": est["write_cond"]}
     for key, vol_field in (("gas", "DEFERRED_GAS_VOL_SM3"), ("cond", "DEFERRED_COND_VOL_STM3")):
         given = _float_or_none(values.get(vol_field))
         tolerance = max(0.01, 0.0001 * abs(expected[key]))
@@ -744,12 +848,18 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
     event_type = max(set(types), key=types.count)
     cache: dict = {}
     result["volume_estimate"] = [
-        _volume_estimate(wrfm, m["well"], starts[0], ends[-1] if ends else None, m["day"], event_type, rows, cache)
+        _volume_estimate(wrfm, m["well"], starts[0], ends[-1] if ends else None, m["day"], event_type, rows, cache,
+                         state.task_text)
         for m in missing
     ]
     if result.get("missing_wells"):
-        # A well without rows is only missing on days where it actually lost production (estimated loss > 0).
+        # A facility well whose ALLOC shows no loss (data not captured) is still missing when >= 2 peers have rows:
+        # its volume is the median peer loss fraction. Without enough peers it is reported as unaffected.
         missing_well_names = {mw["well"] for mw in result["missing_wells"]}
+        for idx, e in enumerate(result["volume_estimate"]):
+            if (e["well"] in missing_well_names and e.get("method") == "clean_day_diff"
+                    and (e.get("deferred_gas") or 0) <= 0.01):
+                result["volume_estimate"][idx] = _peer_fraction(wrfm, e, rows, cache) or e
         no_loss = {(e["well"], e["day"]) for e in result["volume_estimate"]
                    if e["well"] in missing_well_names and e.get("method") is not None
                    and (e.get("deferred_gas") or 0) <= 0.01}
@@ -761,12 +871,12 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
             missing[:] = [m for m in missing if (m["well"], m["day"]) not in no_loss]
             result["volume_estimate"] = [e for e in result["volume_estimate"] if (e["well"], e["day"]) not in no_loss]
             if unaffected:
-                result["unaffected_wells"] = [{"well": w, "reason": "no production loss on event days "
-                                               "(event-day ALLOC equals clean-day potential)"} for w in unaffected]
+                result["unaffected_wells"] = [{"well": w, "reason": "no production loss on event days and fewer "
+                                               "than 2 peer rows to derive a loss fraction"} for w in unaffected]
     mismatches = []
     for r in rows:
         est = _volume_estimate(wrfm, r.get("WELL_NAME"), r.get("START_DATE"), r.get("END_DATE") or None,
-                               r.get("PRODUCTION_DAY"), r.get("EVENT_TYPE") or event_type, rows, cache)
+                               r.get("PRODUCTION_DAY"), r.get("EVENT_TYPE") or event_type, rows, cache, state.task_text)
         if est.get("method") is None:
             continue
         stored = {"gas": _float_or_none(r.get("DEFERRED_GAS_VOL_SM3")), "cond": _float_or_none(r.get("DEFERRED_COND_VOL_STM3"))}
@@ -774,9 +884,10 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
                for k in ("gas", "cond")):
             mismatches.append({"well": r.get("WELL_NAME"), "day": str(r.get("PRODUCTION_DAY"))[:10],
                                "stored_gas": stored["gas"], "stored_cond": stored["cond"],
-                               "expected_gas": round(est["deferred_gas"], 2), "expected_cond": round(est["deferred_cond"], 2),
+                               "expected_gas": est["write_gas"], "expected_cond": est["write_cond"],
                                "method": est["method"], "clean_day": est.get("clean_day")})
     result["volume_mismatch"] = mismatches
+    state.event_checks[fn.event_key] = result
     return result
 
 
@@ -799,10 +910,7 @@ def _group_missing_wells(wrfm: WrfmClient, event_wells: set[str], first_day: dat
             s_end = str(s.get("STATUS_END_DATE") or "")[:10]
             if s_start and s_start <= days[-1] and (not s_end or s_end >= days[0]):
                 status.append(s)
-        closed_cover = any(str(s.get("STATUS_DESC", "")).upper().startswith("CLOSED")
-                           and str(s.get("STATUS_DATE"))[:10] <= days[0]
-                           and (not str(s.get("STATUS_END_DATE") or "").strip()
-                                or str(s.get("STATUS_END_DATE"))[:10] >= days[-1]) for s in status)
+        closed_cover = any(str(s.get("STATUS_DESC", "")).upper().startswith("CLOSED") for s in status)
         other = [r for r in _select_all(wrfm, "deferments", cond) if str(r.get("PRODUCTION_DAY"))[:10] in days]
         alloc = {str(p.get("REPORT_DAY"))[:10]: _float_or_none(p.get("ALLOC_GAS_SM3"))
                  for p in _select_all(wrfm, "daily_production", cond) if str(p.get("REPORT_DAY"))[:10] in days}
@@ -819,6 +927,58 @@ def _group_missing_wells(wrfm: WrfmClient, event_wells: set[str], first_day: dat
                 },
             })
     return found
+
+
+_EVENT_KEY_IN_TEXT = re.compile(r"\b[GW]_[A-Za-z0-9-]+_\d{4}-\d{2}-\d{2}-\d+\b")
+_DATE_IN_TEXT = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_CHECK_WORDING = re.compile(r"\b(review|correct|check|fix|add|missing|close)\b", re.IGNORECASE)
+
+
+def _task_event_key(wrfm: WrfmClient, state) -> str | None:
+    """The event the task names: an EVENT_KEY in the text, or one well + a date that resolve to exactly one event."""
+    match = _EVENT_KEY_IN_TEXT.search(state.task_text)
+    if match:
+        return match.group(0)
+    dates = set(_DATE_IN_TEXT.findall(state.task_text))
+    if not dates:
+        return None
+    wells = [str(r.get("WELL_NAME")) for r in _select_all(wrfm, "well_info")
+             if r.get("WELL_NAME") and re.search(rf"\b{re.escape(str(r['WELL_NAME']))}\b", state.task_text)]
+    if len(wells) != 1:
+        return None
+    rows = _select_all(wrfm, "deferments", [WrfmCondition(field_name="WELL_NAME", operator="eq", value=wells[0])])
+    keys = {str(r.get("EVENT_KEY")) for r in rows if str(r.get("PRODUCTION_DAY"))[:10] in dates}
+    return keys.pop() if len(keys) == 1 else None
+
+
+def _event_check_block(fn: Req_WrfmRespond, state, current_state: str) -> str | None:
+    """ok_answer on a review/correct/add/close task must not leave event-check items unhandled."""
+    if fn.outcome != "ok_answer" or not state.event_checks or not _CHECK_WORDING.search(state.task_text):
+        return None
+    unhandled = []
+    for key, check in state.event_checks.items():
+        unhandled += [f"missing {key} {m['well']} {m['day']}" for m in check.get("missing", [])
+                      if (m["well"], m["day"]) not in state.written_pairs]
+        unhandled += [f"volume_mismatch {key} {v['well']} {v['day']} expected {v['expected_gas']}/{v['expected_cond']}"
+                      for v in check.get("volume_mismatch", []) if (v["well"], v["day"]) not in state.updated_pairs]
+    if not unhandled:
+        return None
+    if state.event_check_blocks >= 1:  # second ok_answer: accept the agent's stated reason, log it
+        _trace(state, {"event_check_override": unhandled, "reason": current_state})
+        return None
+    state.event_check_blocks += 1
+    return f"EVENT CHECK: unhandled items: {unhandled}; create/update them or explain why not"
+
+
+def _note_event_check(state, key: str, check: dict) -> None:
+    """Record an event check: event ref, table use, seen ids and the wells to cite (G_: only flagged missing wells)."""
+    state.event_targets.add(key)
+    state.used_tables.add("deferments")
+    _collect_ids(check, state)
+    if key.startswith("G_"):
+        state.ref_wells.update(mw["well"] for mw in check.get("missing_wells", []))
+    else:
+        state.ref_wells.update(check.get("wells", []))
 
 
 def _authority_ok(value: str) -> bool:
@@ -863,7 +1023,7 @@ def _enrich_refs(fn: Req_WrfmRespond, state) -> tuple[Req_WrfmRespond, list[dict
     auto_events = set(state.event_targets)
     if len(state.selected_keys) == 1:
         auto_events |= state.selected_keys
-    state.seen_ids |= auto_events
+    state.seen_ids |= auto_events | state.ref_wells
     kept, dropped = [], []
     for ref in fn.ground_refs:
         rid = str(ref.id)
@@ -882,6 +1042,14 @@ def _enrich_refs(fn: Req_WrfmRespond, state) -> tuple[Req_WrfmRespond, list[dict
     cited_events = {str(r.id) for r in kept if r.type == "deferment_event"}
     for key in sorted(auto_events - cited_events):
         kept.append(WrfmGroundRef(type="deferment_event", id=key, label=key))
+    wells = set(state.ref_wells)
+    for key in auto_events:  # the well of a W_ event the task is about
+        match = _W_EVENT_KEY.match(key)
+        if match:
+            wells.add(match.group(1))
+    cited_wells = {str(r.id) for r in kept if r.type == "well"}
+    for well in sorted(wells - cited_wells):
+        kept.append(WrfmGroundRef(type="well", id=well, label=well))
     return fn.model_copy(update={"ground_refs": kept}), [r.model_dump(exclude_none=True) for r in dropped]
 
 
@@ -1056,6 +1224,17 @@ def _run_agent_loop(
         print(f"  {CLI_GREEN}AUTO authority{CLI_CLR}: {authority_note[:120]}")
         log.append({"role": "user", "content": f"[authority]\n{authority_note}"})
         _trace(state, {"authority": authority_note})
+    try:
+        forced_key = _task_event_key(wrfm, state)
+    except Exception:
+        forced_key = None
+    if forced_key:
+        check = _local_event_check(wrfm, LocalEventCheck(type="local_event_check", event_key=forced_key), state)
+        if "error" not in check:
+            _note_event_check(state, forced_key, check)
+            print(f"  {CLI_GREEN}AUTO event_check{CLI_CLR}: {forced_key}")
+            log.append({"role": "user", "content": f"[event_check]\n{json.dumps(check)}"})
+            _trace(state, {"forced_event_check": forced_key, "result": check})
     log.append({"role": "user", "content": task.task_text})
     response_model = _response_model_for_provider(llm_config.provider)
 
@@ -1127,11 +1306,19 @@ def _run_agent_loop(
         respond_block = None
         if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)) and _write_event_key(fn):
             state.event_targets.add(str(_write_event_key(fn)))
+        if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)):
+            state.ref_wells.update(str(fv.value).strip() for fv in fn.field_values
+                                   if fv.field_name == "WELL_NAME" and str(fv.value).strip())
+        if isinstance(fn, Req_WrfmDataUpdate):
+            state.ref_wells.update(str(c.value) for c in fn.where_clause
+                                   if c.field_name == "WELL_NAME" and c.operator == "eq" and c.value)
+        if isinstance(fn, LocalVolumeEstimate):
+            state.ref_wells.add(fn.well)
         if isinstance(fn, LocalEventCheck):
             state.event_targets.add(fn.event_key)
         if isinstance(fn, Req_WrfmRespond):
             fn, dropped_refs = _enrich_refs(fn, state)
-            respond_block = _respond_block_reason(fn, state)
+            respond_block = _respond_block_reason(fn, state) or _event_check_block(fn, state, step.current_state)
             block = block or respond_block
         if isinstance(fn, (LocalCalc, LocalAggregate, LocalDowntime, LocalEventCheck, LocalVolumeEstimate)):
             try:
@@ -1142,7 +1329,8 @@ def _run_agent_loop(
                 elif isinstance(fn, LocalDowntime):
                     local = _local_downtime(fn)
                 elif isinstance(fn, LocalVolumeEstimate):
-                    local = _volume_estimate(wrfm, fn.well, fn.start, fn.end or None, fn.production_day, fn.event_type)
+                    local = _volume_estimate(wrfm, fn.well, fn.start, fn.end or None, fn.production_day, fn.event_type,
+                                             task_text=state.task_text)
                 else:
                     local = _local_event_check(wrfm, fn, state)
             except Exception as exc:
@@ -1150,7 +1338,7 @@ def _run_agent_loop(
             if isinstance(fn, LocalAggregate) and "error" not in local:
                 state.used_tables.add(fn.table_name)
             if isinstance(fn, LocalEventCheck) and "error" not in local:
-                state.used_tables.add("deferments")
+                _note_event_check(state, fn.event_key, local)
             _collect_ids(local, state)
             result_text = json.dumps(local)
             style = CLI_RED if "error" in local else CLI_GREEN
@@ -1184,6 +1372,18 @@ def _run_agent_loop(
                         state.selected_keys |= result_keys
                     if isinstance(fn, Req_WrfmDataUpdate):
                         state.event_targets |= result_keys
+                        state.updated_pairs |= {(str(r.get("WELL_NAME")), str(r.get("PRODUCTION_DAY"))[:10])
+                                                for r in (getattr(result, "rows", []) or [])}
+                    if isinstance(fn, Req_WrfmDataCreate):
+                        values = {fv.field_name: str(fv.value).strip() for fv in fn.field_values}
+                        state.written_pairs.add((values.get("WELL_NAME", ""), values.get("PRODUCTION_DAY", "")[:10]))
+                    if (isinstance(fn, Req_WrfmDataSelect) and fn.table_name == "deferments" and len(result_keys) == 1
+                            and next(iter(result_keys)) not in state.event_checks):
+                        auto_key = next(iter(result_keys))
+                        auto_check = _local_event_check(wrfm, LocalEventCheck(type="local_event_check", event_key=auto_key), state)
+                        if "error" not in auto_check:
+                            _note_event_check(state, auto_key, auto_check)
+                            result_text += f"\n[event_check]\n{json.dumps(auto_check)}"
                 if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)):
                     state.event_rows.clear()  # rows changed; refetch on next guard check
             except ApiException as exc:

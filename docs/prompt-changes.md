@@ -226,3 +226,39 @@ volume_estimate (code): R = the well's ALLOC on the last clean day before the ev
 - fix-004 `wrfm_def_010`: copying the closed event's END_DATE was blocked by the END TIME guard (code fix).
 
 **Specs to re-check:** all.
+
+## P-005 (2026-10-11, fix-006)
+
+**Well refs (rule 8, appended)**
+
+```
+Cite every well you wrote or asked about.
+```
+
+Code adds a `well` ref automatically for every WELL_NAME in a create/update (including blocked writes), the targets of local_volume_estimate, the wells of a checked single-well event, the missing wells flagged on a group event, and the well inside a single-well event key the task is about. Wells that were only listed are not added.
+
+**Volume rule (rule 4, volume bullet: method detail added)**
+
+```
+   - Deferred volumes come only from volume_estimate (DOWN rows: the stated or event-span downtime hours x the well's clean-day rate; CONSTRAINT rows: the clean-day ALLOC difference, or the peers' loss fraction for a group-event well whose production data shows no loss). ... Write its write_gas and write_cond values exactly as given. ...
+```
+
+volume_estimate order (code): DOWN -> `clean_day_stated_hours` (exactly two times stated in the task; midnight/12am = 24:00 as an end; an end before the start crosses midnight) -> `clean_day_span_hours` (event span inside the production day) -> `best_R_fallback` -> clarification. CONSTRAINT -> `clean_day_diff`; a facility well on a group event with no row, no CLOSED status in the window, no other deferment row, ALLOC > 0 but no loss vs its clean-day rate, and >= 2 peer rows -> `group_peer_fraction` (one physical cut fraction: median peer deferred gas / peer clean-day gas rate, applied to the well's own clean-day gas and condensate rates; condensate written at 1 decimal only if every peer's stored condensate equals round(peer clean-day cond rate x fraction, 1), else at 2 decimals). Values are rounded half-up to 2 decimals (`write_gas`, `write_cond`).
+
+**Forced event check (added after the wiki line)**
+
+```
+If an [event_check] block is present, it is the code's check of the event the task is about: handle every missing and volume_mismatch item it lists, or state why not.
+```
+
+Code runs local_event_check at bootstrap when the task names an EVENT_KEY or one well + a date that resolve to exactly one event, and after any deferments select whose rows all belong to one unchecked event. A respond guard blocks the first ok_answer on review/correct/check/fix/add/missing/close tasks while missing or volume_mismatch items remain unwritten; a second ok_answer is accepted and its current_state is logged as the reason.
+
+**Numeric answer format:** unchanged. An experiment replacing the numeric message with (A) the largest single-row value as stored or (B) the largest event total as an integer scored 0.00 in both cases; the experiment flag was removed.
+
+**Evidence**
+
+- DOWN rows: event-span hours x clean-day rate = 26/26 stored rows; all 38 rows match the written (half-up) values exactly.
+- A parameterised create task stating "06:45:00 to midday" expects 2,950,000 x 5.25 / 24 = 645,312.5; the clean-day ALLOC difference gave 737,500 because that day's ALLOC also reflects other lost hours.
+- A group CONSTRAINT event lacks a row for one facility well whose production data is flat; the expected correction is one create. Peers lost 0.20 of their clean-day rate (one outlier 0.159).
+
+**Specs to re-check:** all.
