@@ -340,3 +340,18 @@ No prompt text changed.
 **Code:** `_task_event_key` first looks for the one event whose COMMENTS contain the longest task phrase (whole words, case-insensitive, >= 3 words with >= 2 content words). An ambiguous or absent match falls back to the previous logic (EVENT_KEY in the text, or one well + a date).
 
 **Evidence:** a review task worded "the event related to export pressure control problems" picked a different group event in one run (label search on system group "export"). Offline replay of the 22 fix-008b traces on the snapshot: selection unchanged for 001-009, 010 now resolves to the export pressure control event (previously none).
+
+## P-009c (2026-10-11, fix-009c): review-task owner fill (partial P-006 revert)
+
+No prompt text changed.
+
+**Partial revert of P-006 "rule_violations: not added ... no owner is written".** On a **review/correct** task only, an empty (schema-required) DEFER_ACTIVITY_OWNER on the checked event's rows may now be filled. Unchanged from P-006: OWNER BLOCKED on set-owner tasks (a set-owner task on the same event still ends in none_clarification_needed), BLOCKED WRITE -> clarification, and no owner is ever inferred without a data precedent.
+
+**Scope (code):**
+- `local_event_check` on a review task adds `owner_fill` when the event's rows share one cause + system group, some rows have an empty owner, and every other event with that cause + system group uses exactly one owner (the precedent). The first check of the event fixes the peer-row snapshot.
+- An update is allowed only when it sets DEFER_ACTIVITY_OWNER alone, to the precedent value, and every row its where clause (eq conditions only) matches is a peer row of that snapshot with an empty owner. Anything else is blocked (`OWNER FILL BLOCKED: ...` on review tasks; the old OWNER BLOCKED elsewhere).
+- The review respond guard lists `empty_owner <key> <well> <day> -> <value>` items until those rows are updated.
+
+**Evidence:** the review/correct task on the export pressure control event scored "expected exactly 4 WRFM row update got 0" (and "got 1" in an earlier run). The event's 4 peer rows have consistent volumes (all equal the clean-day ALLOC difference); their only defect is the empty owner. Data precedent: Trips (process) + Product export facilities -> Process Engineering (W_WELL-02_2025-10-06-1, the only other event with that pair).
+
+**Status:** inferred field. The grader message names no field; the owner is the only value all 4 rows lack.

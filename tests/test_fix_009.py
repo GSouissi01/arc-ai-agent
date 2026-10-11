@@ -67,5 +67,68 @@ for spec, text in TASKS.items():
 check("009a ambiguous phrase -> fallback (shut in: several events)", agent._comments_event_key(W, "well shut in for flowline valve leak") is None)
 check("009a stop-word-only phrase ignored", agent._comments_event_key(W, "for the event of the") is None)
 
+# ---- 009c: review-task owner fill (set-owner path untouched)
+from ogchallenge_client.dtos import Req_WrfmDataUpdate, WrfmCondition
+KEY = "G_NOVA7_2025-10-09-1"
+def upd(value, where, extra=None):
+    fv = [WrfmKeyValue(field_name="DEFER_ACTIVITY_OWNER", value=value)] + [WrfmKeyValue(field_name=k, value=v) for k, v in (extra or {}).items()]
+    return Req_WrfmDataUpdate(table_name="deferments", field_values=fv,
+                              where_clause=[WrfmCondition(field_name=k, operator="eq", value=v) for k, v in where.items()])
+def check_event(state, tables=T):
+    return agent._local_event_check(DW(tables), agent.LocalEventCheck(type="local_event_check", event_key=KEY), state)
+
+# 003 replay: set-owner intent -> no owner_fill, update blocked as before -> clarification
+s3 = mk_state(TASKS["003"]); s3.today = "2025-10-15"
+c3 = check_event(s3)
+check("009c 003: event check has no owner_fill (set-owner intent)", "owner_fill" not in c3 and not s3.owner_fill)
+b3 = agent._write_block_reason(upd("Process Engineering", {"EVENT_KEY": KEY}), s3, DW(T)) or ""
+check("009c 003: owner update -> OWNER BLOCKED not stated (clarify guard)", b3.startswith("OWNER BLOCKED") and agent._clarify_guard(b3) is not None)
+s3.clarify_blocks.append(agent._clarify_guard(b3))
+r3 = agent._blocked_write_block(Req_WrfmRespond(message="done", outcome="ok_answer", ground_refs=[]), s3) or ""
+check("009c 003: ok_answer -> BLOCKED WRITE -> clarification", r3.startswith("BLOCKED WRITE: OWNER BLOCKED"))
+
+# 010: review intent -> owner_fill Process Engineering on the 4 peer rows
+s10 = mk_state(TASKS["010"]); s10.today = "2025-10-15"
+c10 = check_event(s10)
+fill = c10.get("owner_fill") or {}
+print("  owner_fill", {k: fill.get(k) for k in ("value", "rows", "source_events")})
+check("009c 010: owner_fill = Process Engineering from W_WELL-02_2025-10-06-1",
+      fill.get("value") == "Process Engineering" and fill.get("source_events") == ["W_WELL-02_2025-10-06-1"])
+check("009c 010: 4 peer rows WELL-01/02/04/05", sorted(r["well"] for r in fill.get("rows", [])) == ["WELL-01", "WELL-02", "WELL-04", "WELL-05"])
+ok_rows = 0
+for r in fill.get("rows", []):
+    b = agent._write_block_reason(upd("Process Engineering", {"EVENT_KEY": KEY, "WELL_NAME": r["well"], "PRODUCTION_DAY": r["day"]}), s10, DW(T))
+    ok_rows += b is None
+check("009c 010: 4 per-row owner updates allowed", ok_rows == 4)
+check("009c 010: EVENT_KEY-wide update allowed while only the 4 peers match",
+      agent._write_block_reason(upd("Process Engineering", {"EVENT_KEY": KEY}), s10, DW(T)) is None)
+check("009c 010: other value -> OWNER FILL BLOCKED",
+      (agent._write_block_reason(upd("Surface Production", {"EVENT_KEY": KEY}), s10, DW(T)) or "").startswith("OWNER FILL BLOCKED"))
+check("009c 010: extra field -> blocked",
+      agent._write_block_reason(upd("Process Engineering", {"EVENT_KEY": KEY}, {"COMMENTS": "x"}), s10, DW(T)) is not None)
+w3 = dict(next(x for x in T["deferments"] if x["EVENT_KEY"] == KEY), WELL_NAME="WELL-03", DEFER_ACTIVITY_OWNER="Process Engineering")
+T2 = dict(T, deferments=T["deferments"] + [w3])
+check("009c 010: update also matching a non-peer row (new WELL-03) -> blocked",
+      (agent._write_block_reason(upd("Process Engineering", {"EVENT_KEY": KEY}), s10, DW(T2)) or "").startswith("OWNER FILL BLOCKED"))
+w3e = dict(w3, DEFER_ACTIVITY_OWNER="")
+check("009c 010: non-peer row with empty owner -> blocked",
+      agent._write_block_reason(upd("Process Engineering", {"EVENT_KEY": KEY, "WELL_NAME": "WELL-03"}), s10,
+                                DW(dict(T, deferments=T["deferments"] + [w3e]))) is not None)
+s10b = mk_state(TASKS["010"]); s10b.today = "2025-10-15"
+check("009c 010: no event check yet -> no fill -> blocked",
+      agent._write_block_reason(upd("Process Engineering", {"EVENT_KEY": KEY}), s10b, DW(T)) is not None)
+eb = agent._event_check_block(Req_WrfmRespond(message="ok", outcome="ok_answer", ground_refs=[]), s10, "x") or ""
+check("009c 010: ok_answer before owner updates -> EVENT CHECK lists empty_owner", "empty_owner G_NOVA7_2025-10-09-1 WELL-01" in eb)
+s10.updated_pairs |= {(r["well"], r["day"]) for r in fill["rows"]}
+s10.written_pairs |= {(m["well"], m["day"]) for m in c10.get("missing", [])}
+s10.event_check_blocks = 0
+check("009c 010: after the 4 updates (+ missing create) no unhandled items",
+      agent._event_check_block(Req_WrfmRespond(message="ok", outcome="ok_answer", ground_refs=[]), s10, "x") is None)
+# no unique precedent -> no fill
+T3 = dict(T, deferments=T["deferments"] + [dict(next(x for x in T["deferments"] if x["EVENT_KEY"] == "W_WELL-02_2025-10-06-1"),
+                                                  EVENT_KEY="W_WELL-04_2025-10-02-1", DEFER_ACTIVITY_OWNER="Surface Production")])
+s10c = mk_state(TASKS["010"]); s10c.today = "2025-10-15"
+check("009c conflicting precedent -> no owner_fill", "owner_fill" not in check_event(s10c, T3))
+
 print("FAILS:", fails)
 sys.exit(1 if fails else 0)

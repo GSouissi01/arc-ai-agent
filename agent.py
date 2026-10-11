@@ -263,6 +263,7 @@ class _TaskState:
     event_check_blocks: int = 0
     clarify_blocks: list[tuple[str, str]] = field(default_factory=list)  # (guard, missing info) of blocked writes
     write_ok: bool = False  # a create/update succeeded this task
+    owner_fill: dict[str, dict] = field(default_factory=dict)  # EVENT_KEY -> empty-owner peer rows + precedent (review)
 
 
 def _trace(state, record: dict) -> None:
@@ -401,6 +402,41 @@ def _event_consistency(values: dict, rows: list[dict], state) -> dict:
     return mismatch
 
 
+def _owner_fill(wrfm: WrfmClient, key: str, rows: list[dict]) -> dict | None:
+    """Review tasks: event rows with an empty (schema-required) owner, and the owner every other event with the
+    same cause + system group uses. None unless exactly one such owner exists. Inferred from data, not the wiki."""
+    empty = [r for r in rows if not str(r.get("DEFER_ACTIVITY_OWNER") or "").strip()]
+    labels = {(str(r.get("DEFER_GLOBAL_CAUSE") or ""), str(r.get("DEFER_SYS_GRP") or "")) for r in rows}
+    if not empty or len(labels) != 1:
+        return None
+    cause, sys_grp = labels.pop()
+    others = [r for r in _select_all(wrfm, "deferments") if str(r.get("EVENT_KEY")) != key
+              and r.get("DEFER_GLOBAL_CAUSE") == cause and r.get("DEFER_SYS_GRP") == sys_grp
+              and str(r.get("DEFER_ACTIVITY_OWNER") or "").strip()]
+    owners = {str(r["DEFER_ACTIVITY_OWNER"]).strip() for r in others}
+    if len(owners) != 1:
+        return None
+    return {"value": owners.pop(), "rows": [{"well": str(r.get("WELL_NAME")), "day": str(r.get("PRODUCTION_DAY"))[:10]}
+                                            for r in empty],
+            "source_events": sorted({str(r.get("EVENT_KEY")) for r in others}),
+            "how": "update DEFER_ACTIVITY_OWNER only, one row at a time (where EVENT_KEY, WELL_NAME, PRODUCTION_DAY)"}
+
+
+def _owner_fill_ok(fn, values: dict, state, wrfm: WrfmClient | None) -> bool:
+    """An owner-only update on a review task to empty-owner peer rows of the checked event, with the precedent value."""
+    if (not isinstance(fn, Req_WrfmDataUpdate) or fn.table_name != "deferments" or wrfm is None
+            or set(values) != {"DEFER_ACTIVITY_OWNER"} or not _review_task(state.task_text)):
+        return False
+    where = {c.field_name: str(c.value) for c in fn.where_clause if c.operator == "eq"}
+    fill = state.owner_fill.get(where.get("EVENT_KEY", ""))
+    if not fill or len(where) != len(fn.where_clause) or values["DEFER_ACTIVITY_OWNER"] != fill["value"]:
+        return False
+    peers = {(r["well"], r["day"]) for r in fill["rows"]}
+    matched = _select_all(wrfm, "deferments", list(fn.where_clause))
+    return bool(matched) and all((str(r.get("WELL_NAME")), str(r.get("PRODUCTION_DAY"))[:10]) in peers
+                                 and not str(r.get("DEFER_ACTIVITY_OWNER") or "").strip() for r in matched)
+
+
 def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
     if not isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)):
         return None
@@ -439,7 +475,11 @@ def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
             return f"LABEL: '{label}' not approved for {label_field}; approved: {approved}; pick the closest."
 
     owner = values.get("DEFER_ACTIVITY_OWNER", "")
-    if owner and not is_create:
+    if owner and not is_create and not _owner_fill_ok(fn, values, state, wrfm):
+        fill = state.owner_fill.get(str(key)) if _review_task(state.task_text) else None
+        if fill:
+            return (f"OWNER FILL BLOCKED: on this review task only DEFER_ACTIVITY_OWNER='{fill['value']}' may be set, "
+                    f"only on these empty-owner rows of {key}: {fill['rows']}, with no other field. {fill['how']}.")
         in_task = owner.lower() in state.task_text.lower()
         copied = key is not None and (str(key), owner.lower()) in state.owners
         if not (in_task or copied):
@@ -935,6 +975,11 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
                                "expected_gas": est["write_gas"], "expected_cond": est["write_cond"],
                                "method": est["method"], "clean_day": est.get("clean_day")})
     result["volume_mismatch"] = mismatches
+    if _review_task(state.task_text):
+        fill = state.owner_fill.get(fn.event_key) or _owner_fill(wrfm, fn.event_key, rows)
+        if fill:
+            state.owner_fill.setdefault(fn.event_key, fill)  # first check = the event snapshot
+            result["owner_fill"] = state.owner_fill[fn.event_key]
     state.event_checks[fn.event_key] = result
     return result
 
@@ -1036,6 +1081,9 @@ def _event_check_block(fn: Req_WrfmRespond, state, current_state: str) -> str | 
                       if (m["well"], m["day"]) not in state.written_pairs]
         unhandled += [f"volume_mismatch {key} {v['well']} {v['day']} expected {v['expected_gas']}/{v['expected_cond']}"
                       for v in check.get("volume_mismatch", []) if (v["well"], v["day"]) not in state.updated_pairs]
+        fill = check.get("owner_fill") or {}
+        unhandled += [f"empty_owner {key} {r['well']} {r['day']} -> {fill['value']}" for r in fill.get("rows", [])
+                      if (r["well"], r["day"]) not in state.updated_pairs]
     if not unhandled:
         return None
     if state.event_check_blocks >= 1:  # second ok_answer: accept the agent's stated reason, log it
