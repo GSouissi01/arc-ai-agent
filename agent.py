@@ -402,6 +402,17 @@ def _event_consistency(values: dict, rows: list[dict], state) -> dict:
     return mismatch
 
 
+def _asset_type_precedent(wrfm: WrfmClient, well: str) -> str | None:
+    """Strict-majority ASSET_TYPE of the well's own individual-well (W_) event rows; None on a tie or no rows."""
+    rows = _select_all(wrfm, "deferments", [WrfmCondition(field_name="WELL_NAME", operator="eq", value=str(well))])
+    types = [str(r.get("ASSET_TYPE") or "").strip() for r in rows
+             if str(r.get("EVENT_KEY", "")).startswith("W_") and str(r.get("ASSET_TYPE") or "").strip()]
+    if not types:
+        return None
+    top = max(set(types), key=types.count)
+    return top if types.count(top) * 2 > len(types) else None
+
+
 def _owner_fill(wrfm: WrfmClient, key: str, rows: list[dict]) -> dict | None:
     """Review tasks: event rows with an empty (schema-required) owner, and the owner every other event with the
     same cause + system group uses. None unless exactly one such owner exists. Inferred from data, not the wiki."""
@@ -524,6 +535,15 @@ def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
         volume_block = _volume_check(fn, values, existing, wrfm, state)
         if volume_block:
             return volume_block
+
+    if is_create and not real_rows and fn.table_name == "deferments" and wrfm is not None \
+            and str(values.get("EVENT_KEY", "")).startswith("W_") and values.get("WELL_NAME"):
+        asset_type = _asset_type_precedent(wrfm, values["WELL_NAME"])
+        if asset_type is None:
+            _trace(state, {"asset_type": "ASSET_TYPE NO PRECEDENT", "well": values["WELL_NAME"]})
+        elif values.get("ASSET_TYPE") != asset_type:
+            return (f"ASSET_TYPE: new individual-well event on {values['WELL_NAME']}: write ASSET_TYPE={asset_type} "
+                    "(majority of this well's own W_ event rows).")
 
     if is_create and _create_key(fn, state) in state.create_keys:
         return ("DUPLICATE WRITE BLOCKED: this row was already created earlier in this task. "

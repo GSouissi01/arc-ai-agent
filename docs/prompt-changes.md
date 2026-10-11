@@ -355,3 +355,11 @@ No prompt text changed.
 **Evidence:** the review/correct task on the export pressure control event scored "expected exactly 4 WRFM row update got 0" (and "got 1" in an earlier run). The event's 4 peer rows have consistent volumes (all equal the clean-day ALLOC difference); their only defect is the empty owner. Data precedent: Trips (process) + Product export facilities -> Process Engineering (W_WELL-02_2025-10-06-1, the only other event with that pair).
 
 **Status:** inferred field. The grader message names no field; the owner is the only value all 4 rows lack.
+
+## P-009b (2026-10-11, fix-009b): ASSET_TYPE for new individual-well events
+
+No prompt text changed.
+
+**Code:** a create on a new `W_` event must use the strict-majority ASSET_TYPE of that well's own `W_` event rows (blocked otherwise with the expected value). A tie or no rows falls back to the previous behaviour and logs `ASSET_TYPE NO PRECEDENT` in the trace. Group (`G_`) rows and DEFER_SYS_GRP are not used. No well has a unique ASSET_TYPE in the snapshot (WELL-05 `W_` rows: Well 3, Facility 1), so the rule is a majority, not a unique match (user decision).
+
+**Evidence:** a new WELL-05 event create scored "expected ASSET_TYPE Well got Equipment"; no stored row uses Equipment.

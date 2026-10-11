@@ -130,5 +130,28 @@ T3 = dict(T, deferments=T["deferments"] + [dict(next(x for x in T["deferments"] 
 s10c = mk_state(TASKS["010"]); s10c.today = "2025-10-15"
 check("009c conflicting precedent -> no owner_fill", "owner_fill" not in check_event(s10c, T3))
 
+# ---- 009b: new W_ event ASSET_TYPE = strict majority of the well's own W_ event rows
+check("009b precedent WELL-05 -> Well (W_ rows: Well 3, Facility 1)", agent._asset_type_precedent(DW(T), "WELL-05") == "Well")
+check("009b precedent all wells -> Well", all(agent._asset_type_precedent(DW(T), w) == "Well" for w in ("WELL-01", "WELL-02", "WELL-03", "WELL-04")))
+tie = [dict(r, EVENT_KEY=f"W_WELL-09_2025-10-0{i}-1", WELL_NAME="WELL-09", ASSET_TYPE=a)
+       for i, (r, a) in enumerate(zip(T["deferments"][:2], ("Well", "Facility")), 1)]
+TT = dict(T, deferments=T["deferments"] + tie)
+check("009b conflicting precedent (tie) -> None (fallback)", agent._asset_type_precedent(DW(TT), "WELL-09") is None)
+check("009b no rows -> None (fallback)", agent._asset_type_precedent(DW(T), "WELL-77") is None)
+T006 = TASKS["006"]
+s6 = mk_state(T006); s6.required = {}
+est = agent._volume_estimate(DW(T), "WELL-05", "2025-10-15T08:45:00", "2025-10-15T12:00:00", "2025-10-15", "DOWN", task_text=T006)
+def c6(asset, well="WELL-05", key="W_WELL-05_2025-10-15-1", tables=T):
+    vals = {"EVENT_KEY": key, "WELL_NAME": well, "PRODUCTION_DAY": "2025-10-15", "START_DATE": "2025-10-15T08:45:00",
+            "END_DATE": "2025-10-15T12:00:00", "EVENT_TYPE": "DOWN", "DEFERRED_GAS_VOL_SM3": str(est.get("write_gas")),
+            "DEFERRED_COND_VOL_STM3": str(est.get("write_cond"))}
+    if asset:
+        vals["ASSET_TYPE"] = asset
+    return agent._write_block_reason(Req_WrfmDataCreate(table_name="deferments", field_values=[WrfmKeyValue(field_name=k, value=v) for k, v in vals.items()]), s6, DW(tables)) or ""
+check("009b 006: Equipment -> ASSET_TYPE block expecting Well", c6("Equipment").startswith("ASSET_TYPE: new individual-well event on WELL-05: write ASSET_TYPE=Well"))
+check("009b 006: Well -> no ASSET_TYPE block", not c6("Well").startswith("ASSET_TYPE"))
+check("009b existing event row -> not applied", not c6("Equipment", key="W_WELL-05_2025-10-12-1").startswith("ASSET_TYPE"))
+check("009b G_ event -> not applied", not c6("Equipment", key="G_NOVA7_2025-10-15-1").startswith("ASSET_TYPE"))
+
 print("FAILS:", fails)
 sys.exit(1 if fails else 0)
