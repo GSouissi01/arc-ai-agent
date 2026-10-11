@@ -391,3 +391,7 @@ No prompt text changed.
 **Evidence:** a close task with no time and two open events ("Close the open deferment record.") scored "expected no write actions got 1": the agent created a missing day row of another open event before its END_DATE update was blocked. Replay of all fix-008b / fix-009 / fix-010 close-intent runs (19): no passing run wrote under close + no time; the only run the guard would block is that failing one.
 
 **Known limit:** intent detection is keyword-based, so a non-close task whose text contains a close word (e.g. "restart") and no time is also treated as close.
+
+## P-013a (2026-10-11, fix-013a): largest event = highest single-day gas row — EXPERIMENTAL, revert if 004 fails
+
+No prompt text changed. Code: an ok_answer bare number on an answer-only "largest ... event" gas task is replaced by the stored gas sum (2 decimals) of the event holding the highest single production-day DEFERRED_GAS_VOL_SM3 row (tie -> higher sum); the deferment_event ref is set to that event. Replay of 113 traced final answers: only the largest-event task is eligible; no writes change.

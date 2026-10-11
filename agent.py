@@ -1258,6 +1258,33 @@ def _blocked_write_block(fn: Req_WrfmRespond, state) -> str | None:
     return f"BLOCKED WRITE: {guard} -> respond none_clarification_needed asking for {missing}, cite the event and well"
 
 
+_ONLY_FIGURE = re.compile(r"\bonly\b.*\b(figure|number|value|volume)\b|\b(figure|number|value|volume)\b.*\bonly\b",
+                          re.IGNORECASE)
+_BARE_NUMBER = re.compile(r"^-?\d+(?:\.\d+)?$")
+_LARGEST_EVENT = re.compile(r"\blargest\b.*\bevent\b", re.IGNORECASE)
+
+
+def _largest_event_answer(fn: Req_WrfmRespond, state, wrfm: WrfmClient | None) -> Req_WrfmRespond | None:
+    """EXPERIMENTAL (P-013a). Answer-only "largest ... event" gas figure: the largest event is the one with the highest
+    single production-day DEFERRED_GAS_VOL_SM3 row; the answer is that event's stored gas sum (2 decimals)."""
+    message = (fn.message or "").strip()
+    text = state.task_text
+    if (wrfm is None or fn.outcome != "ok_answer" or not _BARE_NUMBER.match(message)
+            or not _ONLY_FIGURE.search(text) or not _LARGEST_EVENT.search(text) or "gas" not in text.lower()):
+        return None
+    events: dict[str, list[float]] = {}
+    for r in _select_all(wrfm, "deferments"):
+        gas = _float_or_none(r.get("DEFERRED_GAS_VOL_SM3"))
+        if r.get("EVENT_KEY") and gas is not None:
+            events.setdefault(str(r["EVENT_KEY"]), []).append(gas)
+    if not events:
+        return None
+    winner = max(events, key=lambda k: (max(events[k]), sum(events[k])))
+    refs = [r for r in fn.ground_refs if r.type != "deferment_event"]
+    refs.append(WrfmGroundRef(type="deferment_event", id=winner, label=winner))
+    return fn.model_copy(update={"message": repr(round(sum(events[winner]), 2)), "ground_refs": refs})
+
+
 def _enrich_refs(fn: Req_WrfmRespond, state) -> tuple[Req_WrfmRespond, list[dict]]:
     """Drop refs never seen in this task; add a table ref for every table used. Never adds wiki refs."""
     task_lower = state.task_text.lower()
@@ -1571,6 +1598,11 @@ def _run_agent_loop(
             respond_block = (_respond_block_reason(fn, state) or _blocked_write_block(fn, state)
                              or _event_check_block(fn, state, step.current_state))
             block = block or respond_block
+            if not block:
+                ranked_fn = _largest_event_answer(fn, state, wrfm)
+                if ranked_fn is not None:
+                    _trace(state, {"largest_event_answer": {"agent": fn.message, "ranked": ranked_fn.message}})
+                    fn = ranked_fn
         if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)) and block and _clarify_guard(block):
             state.clarify_blocks.append(_clarify_guard(block))
         if isinstance(fn, (LocalCalc, LocalAggregate, LocalDowntime, LocalEventCheck, LocalVolumeEstimate)):
