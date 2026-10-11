@@ -262,3 +262,49 @@ Code runs local_event_check at bootstrap when the task names an EVENT_KEY or one
 - A group CONSTRAINT event lacks a row for one facility well whose production data is flat; the expected correction is one create. Peers lost 0.20 of their clean-day rate (one outlier 0.159).
 
 **Specs to re-check:** all.
+
+## P-006 (2026-10-11, fix-007): blocked writes -> clarification, write scope, COMMENTS convention
+
+**Event check wording (replaces the P-005 line)**
+
+```
+If an [event_check] block is present, it is the code's check of the event the task is about. If the task asks to review/correct the event data, handle every missing and volume_mismatch item it lists, or state why not. Otherwise it is information only.
+If your writes were blocked because the task lacks information (owner, end time, volumes) and no write succeeded, respond none_clarification_needed asking for that information.
+```
+
+The bootstrap block is now labelled `[event_check] INFO ONLY. Act on these items only if the task asks to review/correct the event data.` The event-check respond guard applies only to review / correct / check / reconcile / fix-data tasks, never to set-owner, close or create tasks.
+
+**Blocked writes -> clarification (code):** when a write was blocked by a clarification-type guard (OWNER BLOCKED because the owner is not stated, END TIME BLOCKED, or VOLUME CHECK with no data-derived volume_estimate) and no write succeeded in the task, an ok_answer is blocked with `BLOCKED WRITE: <guard> -> respond none_clarification_needed asking for <missing info>, cite the event and well`.
+
+**Write scope (code, no prompt text):** task intent decides the allowed write types (first match wins):
+
+| Task wording | Allowed |
+|---|---|
+| set / update / change / assign + owner / discipline | update |
+| close / restart(ed) / back online / back on line / resumed / restored / came back / brought back / returned to production or service / ended / finished | update + create |
+| create / add / log | create |
+| review / correct / check / reconcile / fix | create + update |
+| update / change / set / amend (no owner) | update |
+| none of the above (intent unknown) | allowed; the other guards decide; `write_scope: intent unknown` is logged in the trace |
+
+Only a known intent blocks: an out-of-scope write returns `WRITE SCOPE: task asks <intent>; <type> not allowed`.
+
+**COMMENTS convention (rule 4, new-event bullet)**
+
+```
+COMMENTS for new events follow the data convention built by code. Do not write free text.
+```
+
+Code sets COMMENTS = `"<Cause> deferment; prorated by downtime within the day."` (`<Cause>` = the task's cause wording after "due to" / "because of" / "caused by", first letter capitalised) only for a create on a new event, EVENT_TYPE DOWN, partial production day (downtime < 24 h), when the task gives no comment. Existing events keep copying their COMMENTS. Derived from evaluator feedback; not documented in the wiki (0 of 38 snapshot rows follow it; the snapshot comments are free text).
+
+**volume_mismatch method (code):** a row of a group event whose clean-day ALLOC difference shows no loss is checked with the same `group_peer_fraction` method that validated its create; without a peer fraction no mismatch is reported (never an update to 0).
+
+**rule_violations: not added.** The 4 peer rows of the review/correct event break only one rule (DEFER_ACTIVITY_OWNER empty, schema-required). The task does not state an owner, and a set-owner task on the same event expects clarification, so no owner is written.
+
+**Evidence**
+
+- Set-owner task on a group event: the forced event check led to a create of the missing well (succeeded) and a blocked owner update, then ok_answer; expected none_clarification_needed.
+- Create task (new DOWN event, partial day): expected COMMENTS `Wing valve actuator fault deferment; prorated by downtime within the day.`; we wrote the raw cause text.
+- Review/correct group event: after the missing-well create (peer fraction 476,000 / 7.16), volume_mismatch recomputed it with clean_day_diff (0) and the agent overwrote it with 0.
+
+**Specs to re-check:** all.

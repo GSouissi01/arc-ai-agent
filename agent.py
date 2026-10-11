@@ -35,6 +35,7 @@ from ogchallenge_client.dtos import (
     Req_WrfmRespond,
     WrfmCondition,
     WrfmGroundRef,
+    WrfmKeyValue,
 )
 
 CLI_GREEN = "\x1b[32m"
@@ -197,7 +198,8 @@ Use deferment guidelines for deferment event and production-day rules.
 Use extensive ground refs to reference the exact source of your knowledge and authority, especially for write actions.
 
 All wiki documents are already loaded above. Base every decision on them.
-If an [event_check] block is present, it is the code's check of the event the task is about: handle every missing and volume_mismatch item it lists, or state why not.
+If an [event_check] block is present, it is the code's check of the event the task is about. If the task asks to review/correct the event data, handle every missing and volume_mismatch item it lists, or state why not. Otherwise it is information only.
+If your writes were blocked because the task lacks information (owner, end time, volumes) and no write succeeded, respond none_clarification_needed asking for that information.
 
 Decision checklist (follow in order):
 0. Check authority before anything else (see [authority]). No authority -> respond denied_security, even if details are missing, and cite governance/raci.md.
@@ -215,7 +217,7 @@ Decision checklist (follow in order):
 4. Deferment rules:
    - One row per production day per event. Event-level fields are identical across the event's rows.
    - Adding a missing day row (or missing well) for an existing event: copy every event attribute from that event's existing rows: EVENT_KEY, START_DATE, END_DATE (if the event is closed), cause, system group, category, event type, asset type, activity owner and COMMENTS.
-   - New event: build EVENT_KEY exactly as the deferment guide says, matching the format of existing keys. Use approved labels only, choosing the closest approved label for the stated cause and system. Fill every required field. For a new event choose the closest approved labels (cause, system group, activity owner) from the guide. For a row of an existing event copy them.
+   - New event: build EVENT_KEY exactly as the deferment guide says, matching the format of existing keys. Use approved labels only, choosing the closest approved label for the stated cause and system. Fill every required field. For a new event choose the closest approved labels (cause, system group, activity owner) from the guide. For a row of an existing event copy them. COMMENTS for new events follow the data convention built by code. Do not write free text.
    - Closing an event: Only when the task states the restart/end time explicitly. Run local_event_check first. Create every missing production-day row WITH END_DATE already set to the closing timestamp; the closing-day row is prorated from 00:00 to END_DATE. Then update END_DATE on all existing rows of the event. Then run local_event_check again and confirm missing is empty and every row has the same END_DATE.
    - Deferred volumes come only from volume_estimate (DOWN rows: the stated or event-span downtime hours x the well's clean-day rate; CONSTRAINT rows: the clean-day ALLOC difference, or the peers' loss fraction for a group-event well whose production data shows no loss). local_event_check returns volume_estimate for every missing day and missing well of an existing event; for a new event (or any single row) call local_volume_estimate with the well, start, end, production day and event type. Write its write_gas and write_cond values exactly as given. If volume_estimate has no method (clarification_needed), respond none_clarification_needed asking for the volumes and cite the event. Never compute volumes yourself, never guess, and never write 0 unless volume_estimate is 0.
 5. Each step executes its function immediately. A create or update that returned a row is done; never repeat it.
@@ -259,6 +261,8 @@ class _TaskState:
     written_pairs: set[tuple[str, str]] = field(default_factory=set)  # (well, day) created this task
     updated_pairs: set[tuple[str, str]] = field(default_factory=set)  # (well, day) updated this task
     event_check_blocks: int = 0
+    clarify_blocks: list[tuple[str, str]] = field(default_factory=list)  # (guard, missing info) of blocked writes
+    write_ok: bool = False  # a create/update succeeded this task
 
 
 def _trace(state, record: dict) -> None:
@@ -413,8 +417,15 @@ def _write_block_reason(fn, state, wrfm: WrfmClient | None = None):
     elif not any("governance" in p.lower() for p in state.loaded_docs):
         return ("WRITE BLOCKED: load the governance (RACI) wiki document and confirm your role "
                 "is authorized for this activity before any create or update.")
-    values = {fv.field_name: str(fv.value).strip() for fv in fn.field_values}
     is_create = isinstance(fn, Req_WrfmDataCreate)
+    if state.task_text:
+        intent, allowed = _write_intent(state.task_text)
+        write_type = "create" if is_create else "update"
+        if intent == "unknown":
+            _trace(state, {"write_scope": "intent unknown"})
+        elif write_type not in allowed:
+            return f"WRITE SCOPE: task asks {intent}; {write_type} not allowed"
+    values = {fv.field_name: str(fv.value).strip() for fv in fn.field_values}
     key = _write_event_key(fn)
     existing = _known_event_rows(key, state, wrfm) if is_create else None
 
@@ -879,8 +890,14 @@ def _local_event_check(wrfm: WrfmClient, fn: LocalEventCheck, state) -> dict:
                                r.get("PRODUCTION_DAY"), r.get("EVENT_TYPE") or event_type, rows, cache, state.task_text)
         if est.get("method") is None:
             continue
+        no_loss = est.get("method") == "clean_day_diff" and (est.get("deferred_gas") or 0) <= 0.01
+        if fn.event_key.startswith("G_") and no_loss:
+            # Same method as the create check: a flat-ALLOC group-event well is valued by the peers' loss fraction.
+            est = _peer_fraction(wrfm, est, rows, cache)
+            if est is None:
+                continue  # no peer method: never propose an update to 0
         stored = {"gas": _float_or_none(r.get("DEFERRED_GAS_VOL_SM3")), "cond": _float_or_none(r.get("DEFERRED_COND_VOL_STM3"))}
-        if any(stored[k] is None or abs(stored[k] - est[f"deferred_{k}"]) > max(0.01, 0.0001 * abs(est[f"deferred_{k}"]))
+        if any(stored[k] is None or abs(stored[k] - est[f"write_{k}"]) > max(0.01, 0.0001 * abs(est[f"write_{k}"]))
                for k in ("gas", "cond")):
             mismatches.append({"well": r.get("WELL_NAME"), "day": str(r.get("PRODUCTION_DAY"))[:10],
                                "stored_gas": stored["gas"], "stored_cond": stored["cond"],
@@ -931,7 +948,7 @@ def _group_missing_wells(wrfm: WrfmClient, event_wells: set[str], first_day: dat
 
 _EVENT_KEY_IN_TEXT = re.compile(r"\b[GW]_[A-Za-z0-9-]+_\d{4}-\d{2}-\d{2}-\d+\b")
 _DATE_IN_TEXT = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
-_CHECK_WORDING = re.compile(r"\b(review|correct|check|fix|add|missing|close)\b", re.IGNORECASE)
+_CHECK_WORDING = re.compile(r"\b(review|correct|check|reconcile|fix)\b", re.IGNORECASE)
 
 
 def _task_event_key(wrfm: WrfmClient, state) -> str | None:
@@ -952,8 +969,8 @@ def _task_event_key(wrfm: WrfmClient, state) -> str | None:
 
 
 def _event_check_block(fn: Req_WrfmRespond, state, current_state: str) -> str | None:
-    """ok_answer on a review/correct/add/close task must not leave event-check items unhandled."""
-    if fn.outcome != "ok_answer" or not state.event_checks or not _CHECK_WORDING.search(state.task_text):
+    """ok_answer on a review/correct task must not leave event-check items unhandled (not set-owner/close/create tasks)."""
+    if fn.outcome != "ok_answer" or not state.event_checks or not _review_task(state.task_text):
         return None
     unhandled = []
     for key, check in state.event_checks.items():
@@ -1015,6 +1032,81 @@ def _respond_block_reason(fn: Req_WrfmRespond, state) -> str | None:
         if activity and not _authority_ok(state.raci[activity].get(state.role.lower(), "")):
             return f"AUTHORITY: role lacks authority for {activity} -> respond denied_security, cite wiki raci"
     return None
+
+
+_CLOSE_WORDING = re.compile(r"\b(close|restart|restarted|back on ?line|resumed|restored|came back|brought back|"
+                            r"returned to (?:production|service)|ended|finished)\b", re.IGNORECASE)
+_CREATE_WORDING = re.compile(r"\b(create|add|log)\b", re.IGNORECASE)
+_UPDATE_WORDING = re.compile(r"\b(update|change|set|amend)\b", re.IGNORECASE)
+
+
+def _write_intent(text: str) -> tuple[str, set[str]]:
+    """Task intent -> allowed write types (first match wins)."""
+    if _OWNER_VERB.search(text) and _OWNER_NOUN.search(text):
+        return "set owner", {"update"}
+    if _CLOSE_WORDING.search(text):
+        return "close", {"update", "create"}
+    if _CREATE_WORDING.search(text):
+        return "create", {"create"}
+    if _CHECK_WORDING.search(text):
+        return "review", {"create", "update"}
+    if _UPDATE_WORDING.search(text):
+        return "update", {"update"}
+    return "unknown", {"create", "update"}  # no keyword: fall back to the other guards
+
+
+def _review_task(text: str) -> bool:
+    """Review/correct/check/reconcile/fix-data wording, and not a set-owner, close or create task."""
+    return _write_intent(text)[0] == "review"
+
+
+_CAUSE_IN_TEXT = re.compile(r"\b(?:due to|because of|caused by)\s+(.+?)"
+                            r"(?=\s+(?:from|between|since|starting|until|at|on)\b|[.;,]|$)", re.IGNORECASE)
+
+
+def build_comment(cause_text: str, day_kind: str, event_type: str) -> str | None:
+    """COMMENTS convention for a new DOWN event on a partial production day (from evaluator feedback, not the wiki)."""
+    cause = (cause_text or "").strip()
+    if not cause or day_kind != "partial" or str(event_type).upper() != "DOWN":
+        return None
+    return f"{cause[0].upper()}{cause[1:]} deferment; prorated by downtime within the day."
+
+
+def _convention_comment(fn, state, wrfm) -> str | None:
+    """The code-built COMMENTS for a create on a new event, or None when the convention does not apply."""
+    if not isinstance(fn, Req_WrfmDataCreate) or fn.table_name != "deferments" or "comment" in state.task_text.lower():
+        return None
+    match = _CAUSE_IN_TEXT.search(state.task_text)
+    values = {fv.field_name: str(fv.value).strip() for fv in fn.field_values}
+    if not match or not all(values.get(f) for f in ("EVENT_KEY", "START_DATE", "PRODUCTION_DAY")):
+        return None
+    existing = _known_event_rows(values["EVENT_KEY"], state, wrfm)
+    if existing is None or any(r.get("START_DATE") for r in existing):
+        return None  # unknown or existing event: copy its COMMENTS
+    try:
+        hours = _downtime_h(values["START_DATE"], values.get("END_DATE") or None, values["PRODUCTION_DAY"], exact=True)
+    except (TypeError, ValueError):
+        return None
+    return build_comment(match.group(1), "partial" if 0 < hours < 24 else "full", values.get("EVENT_TYPE", ""))
+
+
+def _clarify_guard(block: str) -> tuple[str, str] | None:
+    """(guard, missing info) when a write block means the task lacks information only the user can give."""
+    if block.startswith("OWNER BLOCKED") and "not stated in the task" in block:
+        return "OWNER BLOCKED", "the accountable DEFER_ACTIVITY_OWNER"
+    if block.startswith("END TIME BLOCKED"):
+        return "END TIME BLOCKED", "the exact restart/end timestamp"
+    if block.startswith("VOLUME CHECK: no data-derived volume_estimate"):
+        return "VOLUME CHECK (no volume_estimate)", "the deferred volumes"
+    return None
+
+
+def _blocked_write_block(fn: Req_WrfmRespond, state) -> str | None:
+    """Writes blocked for missing information and none succeeded: the answer is a clarification, not ok_answer."""
+    if fn.outcome != "ok_answer" or not state.clarify_blocks or state.write_ok:
+        return None
+    guard, missing = state.clarify_blocks[-1]
+    return f"BLOCKED WRITE: {guard} -> respond none_clarification_needed asking for {missing}, cite the event and well"
 
 
 def _enrich_refs(fn: Req_WrfmRespond, state) -> tuple[Req_WrfmRespond, list[dict]]:
@@ -1233,7 +1325,8 @@ def _run_agent_loop(
         if "error" not in check:
             _note_event_check(state, forced_key, check)
             print(f"  {CLI_GREEN}AUTO event_check{CLI_CLR}: {forced_key}")
-            log.append({"role": "user", "content": f"[event_check]\n{json.dumps(check)}"})
+            log.append({"role": "user", "content": "[event_check] INFO ONLY. Act on these items only if the task asks "
+                                                   f"to review/correct the event data.\n{json.dumps(check)}"})
             _trace(state, {"forced_event_check": forced_key, "result": check})
     log.append({"role": "user", "content": task.task_text})
     response_model = _response_model_for_provider(llm_config.provider)
@@ -1301,6 +1394,14 @@ def _run_agent_loop(
         })
 
         dispatch_ok = False
+        comment_note = ""
+        built_comment = _convention_comment(fn, state, wrfm)
+        if built_comment:
+            given = next((str(fv.value) for fv in fn.field_values if fv.field_name == "COMMENTS"), "")
+            if given != built_comment:
+                fn = fn.model_copy(update={"field_values": [fv for fv in fn.field_values if fv.field_name != "COMMENTS"]
+                                           + [WrfmKeyValue(field_name="COMMENTS", value=built_comment)]})
+                comment_note = f"NOTE: COMMENTS set by code to the data convention: {built_comment!r}\n"
         block = _write_block_reason(fn, state, wrfm)
         dropped_refs = []
         respond_block = None
@@ -1318,8 +1419,11 @@ def _run_agent_loop(
             state.event_targets.add(fn.event_key)
         if isinstance(fn, Req_WrfmRespond):
             fn, dropped_refs = _enrich_refs(fn, state)
-            respond_block = _respond_block_reason(fn, state) or _event_check_block(fn, state, step.current_state)
+            respond_block = (_respond_block_reason(fn, state) or _blocked_write_block(fn, state)
+                             or _event_check_block(fn, state, step.current_state))
             block = block or respond_block
+        if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)) and block and _clarify_guard(block):
+            state.clarify_blocks.append(_clarify_guard(block))
         if isinstance(fn, (LocalCalc, LocalAggregate, LocalDowntime, LocalEventCheck, LocalVolumeEstimate)):
             try:
                 if isinstance(fn, LocalCalc):
@@ -1385,6 +1489,7 @@ def _run_agent_loop(
                             _note_event_check(state, auto_key, auto_check)
                             result_text += f"\n[event_check]\n{json.dumps(auto_check)}"
                 if isinstance(fn, (Req_WrfmDataCreate, Req_WrfmDataUpdate)):
+                    state.write_ok = True
                     state.event_rows.clear()  # rows changed; refetch on next guard check
             except ApiException as exc:
                 result_text = exc.api_error.model_dump_json(exclude_none=True)
@@ -1392,7 +1497,7 @@ def _run_agent_loop(
             except Exception as exc:
                 result_text = f'{{"error": "{exc}"}}'
                 print(f"    {CLI_RED}ERR: {exc}{CLI_CLR}")
-            result_text = note + result_text
+            result_text = note + comment_note + result_text
 
         log.append({"role": "tool", "content": f"RESULT of {fn_type}: {result_text}", "tool_call_id": step_id})
         _trace(state, {
