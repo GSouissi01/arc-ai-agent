@@ -155,3 +155,74 @@ Fill every required field. For a new event choose the closest approved labels (c
 No change for `wrfm_def_004` (pending investigation).
 
 **Specs to re-check:** all (`wrfm_def_001` to `wrfm_def_010`).
+
+## P-004 (2026-10-11, fix-005)
+
+**Added rule 0 (first in the checklist)**
+
+```
+0. Check authority before anything else (see [authority]). No authority -> respond denied_security, even if details are missing, and cite governance/raci.md.
+```
+
+A computed `[authority]` note (role vs. every RACI activity) is now added to the context after the bootstrap.
+
+**Rule 2: owner clause replaced (conflict with the new-event bullet resolved)**
+
+Old:
+
+```
+   - the task asks you to set a value through a rule the wiki does not state. DEFER_ACTIVITY_OWNER is the accountable discipline; never infer it from the cause or from your own role.
+```
+
+New:
+
+```
+   - the task asks you to change DEFER_ACTIVITY_OWNER on an existing event and the new owner is not stated in the task or the docs. DEFER_ACTIVITY_OWNER is the accountable discipline; never infer it from the cause or from your own role. For a new event the owner is required: take it from the docs (the guide's owner definition: the accountable discipline for the cause); do not ask.
+```
+
+**Rule 2: label mapping added**
+
+```
+   Never ask for clarification only because a free-text cause, system or owner word is not an approved label. Map it to the closest approved label from the deferment guide lists (for example, a valve or actuator fault -> the matching equipment breakdown cause, and the system group that contains that equipment). Ask only when two labels fit equally well.
+```
+
+**Rule 4: copy bullet extended**
+
+```
+   - Adding a missing day row (or missing well) for an existing event: copy every event attribute from that event's existing rows: EVENT_KEY, START_DATE, END_DATE (if the event is closed), cause, system group, category, event type, asset type, activity owner and COMMENTS.
+```
+
+**Rule 8: appended**
+
+```
+Always cite the deferment event you were asked about (by EVENT_KEY), also in clarification and denied answers.
+```
+
+**Rule 4: volume bullet replaced (single rule for DOWN and CONSTRAINT)**
+
+Old (P-002, a/b/c rate order):
+
+```
+   - Deferred volumes: deferred volume for a row = R × downtime_h / 24, where R is the well's full-day rate. ... (a. rate_per_well, b. ALLOC × 24 / uptime_h, c. CONSTRAINT -> clarification)
+```
+
+New:
+
+```
+   - Deferred volumes come only from volume_estimate. local_event_check returns volume_estimate for every missing day and missing well of an existing event; for a new event (or any single row) call local_volume_estimate with the well, start, end, production day and event type. Write deferred_gas and deferred_cond rounded to 2 decimals. If volume_estimate has no method (clarification_needed), respond none_clarification_needed asking for the volumes and cite the event. Never compute volumes yourself, never guess, and never write 0 unless volume_estimate is 0.
+```
+
+volume_estimate (code): R = the well's ALLOC on the last clean day before the event START (no deferment row for that well that day). Day has daily_production -> `clean_day_diff` (R − ALLOC(day)); no daily_production and DOWN -> `clean_day_hours` (R × downtime_h / 24); no clean day and DOWN -> `best_R_fallback`; otherwise (incl. CONSTRAINT without data) -> no method, clarification. Unrounded inside; the validator compares creates against it with tolerance max(0.01, 0.01%).
+
+**Evidence (fix-005 Step 0, 001 snapshot):** clean-day difference fits 38/38 stored rows within 0.01 (37/38 exact to 2 decimals; 1 condensate row differs by 0.01 because both stored values were rounded independently): 26/26 DOWN, 12/12 CONSTRAINT. Earlier hypotheses: H1 (pre-event day) 75%, H2/H3 75%, H4 0%, H5 f not constant. 001's missing day gives 2,380,000.00 / 35.80 exactly.
+
+**Reason**
+
+- fix-004 `wrfm_def_002`: new row did not copy COMMENTS.
+- fix-004 `wrfm_def_003`: no deferment_event ref in a clarification answer.
+- fix-004 `wrfm_def_004`: deferment_event ref dropped by the enricher (local_aggregate ids not counted as seen; code fix).
+- fix-004 `wrfm_def_005`: Operations Supervisor answered none_clarification_needed instead of denied_security.
+- fix-004 `wrfm_def_006`: asked for clarification because the free-text cause was not an approved label.
+- fix-004 `wrfm_def_010`: copying the closed event's END_DATE was blocked by the END TIME guard (code fix).
+
+**Specs to re-check:** all.
